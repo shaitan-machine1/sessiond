@@ -12,7 +12,7 @@ Phase 1 session lifecycle stack:
 - `user-service-manager`: s6/s6-rc entrypoint and a default per-user D-Bus
   longrun.
 
-The workspace pins `scope-id` from the exact SSH tag `scoped/v0.1.0` and uses
+The workspace pins `scope-id` from the exact SSH tag `v0.1.0` and uses
 zbus 6. UUIDv7 session IDs are lowercase 32-digit hex strings.
 
 ## Build and test
@@ -25,8 +25,19 @@ cargo fmt --all -- --check
 
 Unit tests use fake scoped/runtime/launcher backends, including two concurrent
 sessions sharing one manager, last-session cleanup, shutdown ordering and
-unsafe runtime-path rejection. A private-bus/root e2e can run against scoped
-without a display, seat or VT.
+unsafe runtime-path rejection. Root-required end-to-end tests are committed
+and use private D-Bus/cgroup state without a display, seat or VT:
+
+```sh
+./tests/root-e2e.sh
+./tests/root-user-launcher-e2e.sh
+```
+
+`root-e2e.sh` builds the sibling scoped checkout (override with
+`SCOPED_REPO=/path/to/scoped`), exercises real cgroup migration, shared-manager
+and clean/unclean session teardown, and calls the installed build of
+`pam_sessiond` through a temporary PAM configuration. Both scripts require
+passwordless `sudo`; they return status 77 when prerequisites are unavailable.
 
 ## Install
 

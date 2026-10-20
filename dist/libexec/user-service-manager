@@ -15,6 +15,13 @@ rm -rf "$live"
 
 s6-svscan "$scandir" &
 svscan_pid=$!
+count=0
+until s6-svscanctl -a "$scandir" 2>/dev/null; do
+    kill -0 "$svscan_pid" 2>/dev/null || exit 1
+    count=$((count + 1))
+    [ "$count" -lt 300 ] || exit 1
+    sleep 0.01
+done
 stopping=0
 stop_manager() {
     [ "$stopping" -eq 0 ] || return 0

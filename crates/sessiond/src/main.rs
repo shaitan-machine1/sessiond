@@ -66,7 +66,20 @@ async fn main() -> anyhow::Result<()> {
         .object_server()
         .at(OBJECT_PATH, Manager::new(manager.clone()))
         .await?;
-    connection.request_name(BUS_NAME).await?;
+    // Not zbus's default flags (ALLOW_REPLACEMENT | REPLACE_EXISTING |
+    // DO_NOT_QUEUE): those let a second instance steal the name from the
+    // running daemon, which keeps running unreachable while the supervisor
+    // still sees it as healthy. Duplicates must fail instead.
+    match connection
+        .request_name_with_flags(BUS_NAME, zbus::fdo::RequestNameFlags::DO_NOT_QUEUE)
+        .await
+    {
+        Ok(_) => {}
+        Err(zbus::Error::NameTaken) => {
+            anyhow::bail!("{BUS_NAME} is already owned on this bus; another sessiond is running")
+        }
+        Err(e) => return Err(e.into()),
+    }
 
     let emitter = SignalEmitter::new(&connection, OBJECT_PATH)?;
     let mut events = manager.subscribe();
@@ -132,6 +145,12 @@ async fn main() -> anyhow::Result<()> {
     });
 
     tracing::info!(bus_name = BUS_NAME, "sessiond ready");
-    tokio::signal::ctrl_c().await?;
+    // Losing the bus connection means losing the name and every session
+    // operation with it, so exit and let the supervisor restart us;
+    // `reconcile` rebuilds state from the runtime store on the way back up.
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => result?,
+        () = connection.closed() => anyhow::bail!("lost the D-Bus connection"),
+    }
     Ok(())
 }

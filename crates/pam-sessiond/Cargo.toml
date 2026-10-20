@@ -1,0 +1,17 @@
+[package]
+name = "pam-sessiond"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+humantime.workspace = true
+libc.workspace = true
+nix.workspace = true
+pam-ffi.workspace = true
+tokio.workspace = true
+zbus.workspace = true

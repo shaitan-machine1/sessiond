@@ -1,0 +1,21 @@
+runtime_parent = "/run/user"
+state_dir = "/run/sessiond"
+linger = false
+
+[session]
+open_timeout = "30s"
+
+[session.shutdown]
+mode = "scope"
+leader_timeout = "10s"
+scope_timeout = "10s"
+
+[user_service_manager]
+launcher = "/usr/libexec/sessiond/sessiond-user-launcher"
+entrypoint = "/usr/libexec/sessiond/user-service-manager"
+ready_timeout = "30s"
+
+[user_service_manager.shutdown]
+mode = "leader"
+leader_timeout = "30s"
+scope_timeout = "10s"

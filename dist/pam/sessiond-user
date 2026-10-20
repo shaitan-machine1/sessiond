@@ -1,0 +1,4 @@
+# Dedicated non-recursive user-manager stack.
+session required pam_limits.so
+session required pam_env.so
+session required pam_permit.so

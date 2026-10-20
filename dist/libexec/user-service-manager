@@ -32,6 +32,15 @@ stop_manager() {
 trap stop_manager TERM INT HUP
 
 s6-rc-init -c "$compiled" -l "$live" "$scandir"
+for service in "$live"/servicedirs/*; do
+    count=0
+    until s6-svstat "$service" >/dev/null 2>&1; do
+        kill -0 "$svscan_pid" 2>/dev/null || exit 1
+        count=$((count + 1))
+        [ "$count" -lt 300 ] || exit 1
+        sleep 0.01
+    done
+done
 s6-rc -l "$live" -u change default
 count=0
 while [ ! -S "$XDG_RUNTIME_DIR/bus" ]; do

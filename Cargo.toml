@@ -3,6 +3,7 @@ members = [
   "crates/pam-ffi",
   "crates/pam-sessiond",
   "crates/sessiond",
+  "crates/sessionctl",
   "crates/sessiond-user-launcher",
 ]
 resolver = "2"

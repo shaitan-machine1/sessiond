@@ -535,6 +535,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "sessionctl"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "tokio",
+ "zbus",
+]
+
+[[package]]
 name = "sessiond"
 version = "0.1.0"
 dependencies = [

@@ -9,6 +9,8 @@ Phase 1 session lifecycle stack:
   timeout, PAM environment setup, PAM-data session ID and `fail_open`;
   failures are reported with service context through `pam_syslog()` using a
   constant format string;
+- `sessionctl`: readable system-bus client with public session inventory and
+  root-authorized asynchronous close requests;
 - `sessiond-user-launcher`: a dedicated single-threaded PAM/credential/process
   launcher tracked as target `manager`;
 - `user-service-manager`: s6/s6-rc entrypoint and a default per-user D-Bus
@@ -16,6 +18,18 @@ Phase 1 session lifecycle stack:
 
 The workspace pins `scope-id` from the exact SSH tag `v0.1.0` and uses
 zbus 6. UUIDv7 session IDs are lowercase 32-digit hex strings.
+
+Administrative client commands are:
+
+```sh
+sessionctl list
+sessionctl close SESSION_ID
+```
+
+`list` prints an aligned `SESSION`/`UID` table or `No sessions.`. `close`
+reports that closure was requested because daemon teardown is asynchronous and
+idempotent. The client uses only the system bus; sessiond's D-Bus policy and
+peer credentials, not the client, enforce authorization.
 
 ## Build and test
 
@@ -46,8 +60,9 @@ reaches `pam_syslog()` with the literal `%s` format and contextual text.
 
 ## Install
 
-Install the binaries under `/usr/bin` and `/usr/libexec/sessiond`, the PAM
-module in the distribution module directory, and the files under `dist/`:
+Install `sessiond` and `sessionctl` under `/usr/bin`, the launcher under
+`/usr/libexec/sessiond`, the PAM module in the distribution module directory,
+and the files under `dist/`:
 
 - D-Bus policy `org.decoupling.sessiond1.conf`;
 - `/etc/sessiond/sessiond.toml`;

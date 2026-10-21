@@ -67,6 +67,22 @@ unsafe extern "C" {
         module_data_name: *const c_char,
         data: *mut *const c_void,
     ) -> c_int;
+    fn pam_syslog(pamh: *const PamHandle, priority: c_int, format: *const c_char, ...);
+}
+
+/// Logs one message through Linux-PAM with a constant format string.
+///
+/// Interior NULs are escaped before crossing the FFI boundary, so neither the
+/// message nor caller-controlled content can become a variadic format string.
+fn syslog_message(message: &str) -> CString {
+    CString::new(message.replace('\0', "\\0")).expect("NUL bytes were escaped")
+}
+
+pub fn syslog(pamh: &PamHandle, priority: c_int, message: &str) {
+    let message = syslog_message(message);
+    // SAFETY: pamh is live, both strings are NUL-terminated, and the constant
+    // format consumes exactly the one supplied C-string argument.
+    unsafe { pam_syslog(pamh, priority, c"%s".as_ptr(), message.as_ptr()) };
 }
 
 /// # Safety
@@ -212,5 +228,18 @@ impl Drop for Transaction {
         }
         // SAFETY: each successful pam_start must have one pam_end.
         unsafe { pam_end(self.handle, self.last_status) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn syslog_message_escaping_removes_interior_nuls() {
+        assert_eq!(
+            syslog_message("before\0after").to_bytes(),
+            b"before\\0after"
+        );
     }
 }

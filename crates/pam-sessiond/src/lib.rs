@@ -1,4 +1,4 @@
-use libc::{c_char, c_int, c_void};
+use libc::{LOG_ERR, c_char, c_int, c_void};
 use nix::unistd::User;
 use pam_ffi::{PAM_SESSION_ERR, PAM_SUCCESS, PamHandle};
 use std::ffi::{CStr, CString};
@@ -47,6 +47,31 @@ impl Options {
     }
 }
 
+struct Failure {
+    status: c_int,
+    message: String,
+}
+
+impl Failure {
+    fn new(status: c_int, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            message: message.into(),
+        }
+    }
+}
+
+fn emit_message(message: &str, mut logger: impl FnMut(&str)) {
+    logger(message);
+}
+
+unsafe fn log_error(pamh: *mut PamHandle, message: &str) {
+    // SAFETY: PAM supplies a live, non-null handle to every module entry point.
+    if let Some(handle) = unsafe { pamh.as_ref() } {
+        emit_message(message, |message| pam_ffi::syslog(handle, LOG_ERR, message));
+    }
+}
+
 unsafe extern "C" fn cleanup_sid(_pamh: *mut PamHandle, data: *mut c_void, _status: c_int) {
     if !data.is_null() {
         // SAFETY: pam_sm_open_session stored exactly one Box<String> here.
@@ -58,7 +83,7 @@ fn run_async<T>(future: impl std::future::Future<Output = Result<T, String>>) ->
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .map_err(|error| error.to_string())?
+        .map_err(|error| format!("create PAM async runtime: {error}"))?
         .block_on(future)
 }
 
@@ -66,60 +91,105 @@ async fn open(uid: u32, timeout: Duration) -> Result<(String, String), String> {
     tokio::time::timeout(timeout, async {
         let connection = zbus::Connection::system()
             .await
-            .map_err(|error| error.to_string())?;
-        SessiondProxy::new(&connection)
+            .map_err(|error| format!("connect to the system bus for OpenSession: {error}"))?;
+        let proxy = SessiondProxy::new(&connection)
             .await
-            .map_err(|error| error.to_string())?
+            .map_err(|error| format!("create sessiond proxy for OpenSession: {error}"))?;
+        proxy
             .open_session(uid)
             .await
-            .map_err(|error| error.to_string())
+            .map_err(|error| format!("sessiond OpenSession for uid {uid}: {error}"))
     })
     .await
-    .map_err(|_| "OpenSession timed out".to_owned())?
+    .map_err(|_| {
+        format!(
+            "sessiond OpenSession for uid {uid} timed out after {}",
+            humantime::format_duration(timeout)
+        )
+    })?
 }
 
 async fn close(sid: &str, timeout: Duration) -> Result<(), String> {
     tokio::time::timeout(timeout, async {
-        let connection = zbus::Connection::system()
+        let connection = zbus::Connection::system().await.map_err(|error| {
+            format!("connect to the system bus for CloseSession {sid}: {error}")
+        })?;
+        let proxy = SessiondProxy::new(&connection)
             .await
-            .map_err(|error| error.to_string())?;
-        SessiondProxy::new(&connection)
-            .await
-            .map_err(|error| error.to_string())?
+            .map_err(|error| format!("create sessiond proxy for CloseSession {sid}: {error}"))?;
+        proxy
             .close_session(sid)
             .await
-            .map_err(|error| error.to_string())
+            .map_err(|error| format!("sessiond CloseSession for {sid}: {error}"))
     })
     .await
-    .map_err(|_| "CloseSession timed out".to_owned())?
+    .map_err(|_| {
+        format!(
+            "sessiond CloseSession for {sid} timed out after {}",
+            humantime::format_duration(timeout)
+        )
+    })?
+}
+
+unsafe fn rollback(pamh: *mut PamHandle, sid: &str, timeout: Duration) {
+    if let Err(error) = run_async(close(sid, timeout)) {
+        // SAFETY: forwarded live PAM handle.
+        unsafe { log_error(pamh, &format!("failed to roll back session {sid}: {error}")) };
+    }
 }
 
 unsafe fn open_inner(pamh: *mut PamHandle, argc: c_int, argv: *const *const c_char) -> c_int {
     // SAFETY: caller is Linux-PAM and supplies a live handle/options array.
     let options = unsafe { Options::parse(argc, argv) };
-    let result = (|| -> Result<(), c_int> {
+    let result = (|| -> Result<(), Failure> {
         // SAFETY: live PAM handle from the module entry point.
-        let username = unsafe { pam_ffi::get_user(pamh) }?;
-        let user = User::from_name(&username)
-            .map_err(|_| PAM_SESSION_ERR)?
-            .ok_or(pam_ffi::PAM_USER_UNKNOWN)?;
-        let timeout = options.timeout.unwrap_or(Duration::from_secs(30));
-        let (sid, runtime) = run_async(open(user.uid.as_raw(), timeout)).map_err(|error| {
-            eprintln!("pam_sessiond: {error}");
-            PAM_SESSION_ERR
+        let username = unsafe { pam_ffi::get_user(pamh) }.map_err(|status| {
+            Failure::new(
+                status,
+                format!("pam_get_user failed with PAM status {status}"),
+            )
         })?;
+        let user = User::from_name(&username)
+            .map_err(|error| {
+                Failure::new(
+                    PAM_SESSION_ERR,
+                    format!("look up user {username:?}: {error}"),
+                )
+            })?
+            .ok_or_else(|| {
+                Failure::new(
+                    pam_ffi::PAM_USER_UNKNOWN,
+                    format!("user {username:?} does not exist"),
+                )
+            })?;
+        let uid = user.uid.as_raw();
+        let timeout = options.timeout.unwrap_or(Duration::from_secs(30));
+        let (sid, runtime) =
+            run_async(open(uid, timeout)).map_err(|error| Failure::new(PAM_SESSION_ERR, error))?;
 
         let environment = [
-            format!("XDG_RUNTIME_DIR={runtime}"),
-            format!("XDG_SESSION_ID={sid}"),
-            format!("DBUS_SESSION_BUS_ADDRESS=unix:path={runtime}/bus"),
+            ("XDG_RUNTIME_DIR", runtime.clone()),
+            ("XDG_SESSION_ID", sid.clone()),
+            (
+                "DBUS_SESSION_BUS_ADDRESS",
+                format!("unix:path={runtime}/bus"),
+            ),
         ];
-        for value in environment {
-            let value = CString::new(value).map_err(|_| PAM_SESSION_ERR)?;
+        for (name, value) in environment {
+            let assignment = CString::new(format!("{name}={value}")).map_err(|_| {
+                Failure::new(
+                    PAM_SESSION_ERR,
+                    format!("sessiond returned an invalid NUL-containing {name} value"),
+                )
+            })?;
             // SAFETY: live PAM handle; pam_putenv copies the string.
-            if let Err(status) = unsafe { pam_ffi::put_env(pamh, &value) } {
-                let _ = run_async(close(&sid, timeout));
-                return Err(status);
+            if let Err(status) = unsafe { pam_ffi::put_env(pamh, &assignment) } {
+                // SAFETY: forwarded live PAM handle.
+                unsafe { rollback(pamh, &sid, timeout) };
+                return Err(Failure::new(
+                    status,
+                    format!("pam_putenv failed for {name} with PAM status {status}"),
+                ));
             }
         }
 
@@ -128,15 +198,26 @@ unsafe fn open_inner(pamh: *mut PamHandle, argc: c_int, argv: *const *const c_ch
         if let Err(status) = unsafe { pam_ffi::set_data(pamh, DATA_KEY, data, cleanup_sid) } {
             // SAFETY: PAM rejected ownership transfer.
             let sid = unsafe { Box::from_raw(data.cast::<String>()) };
-            let _ = run_async(close(&sid, timeout));
-            return Err(status);
+            // SAFETY: forwarded live PAM handle.
+            unsafe { rollback(pamh, &sid, timeout) };
+            return Err(Failure::new(
+                status,
+                format!("pam_set_data failed for session {sid} with PAM status {status}"),
+            ));
         }
         Ok(())
     })();
     match result {
         Ok(()) => PAM_SUCCESS,
-        Err(_) if options.fail_open => PAM_SUCCESS,
-        Err(status) => status,
+        Err(failure) => {
+            // SAFETY: forwarded live PAM handle.
+            unsafe { log_error(pamh, &failure.message) };
+            if options.fail_open {
+                PAM_SUCCESS
+            } else {
+                failure.status
+            }
+        }
     }
 }
 
@@ -153,13 +234,14 @@ unsafe fn close_inner(pamh: *mut PamHandle, argc: c_int, argv: *const *const c_c
     let timeout = options.timeout.unwrap_or(Duration::from_secs(30));
     match run_async(close(sid, timeout)) {
         Ok(()) => PAM_SUCCESS,
-        Err(error) if options.fail_open => {
-            eprintln!("pam_sessiond: {error}");
-            PAM_SUCCESS
-        }
         Err(error) => {
-            eprintln!("pam_sessiond: {error}");
-            PAM_SESSION_ERR
+            // SAFETY: forwarded live PAM handle.
+            unsafe { log_error(pamh, &error) };
+            if options.fail_open {
+                PAM_SUCCESS
+            } else {
+                PAM_SESSION_ERR
+            }
         }
     }
 }
@@ -176,11 +258,17 @@ pub unsafe extern "C" fn pam_sm_open_session(
     argc: c_int,
     argv: *const *const c_char,
 ) -> c_int {
-    std::panic::catch_unwind(AssertUnwindSafe(|| {
+    match std::panic::catch_unwind(AssertUnwindSafe(|| {
         // SAFETY: forwards Linux-PAM's module arguments.
         unsafe { open_inner(pamh, argc, argv) }
-    }))
-    .unwrap_or(PAM_SESSION_ERR)
+    })) {
+        Ok(status) => status,
+        Err(_) => {
+            // SAFETY: forwarded live PAM handle.
+            unsafe { log_error(pamh, "panic while opening a session through pam_sessiond") };
+            PAM_SESSION_ERR
+        }
+    }
 }
 
 /// Linux-PAM session-close entry point.
@@ -194,9 +282,32 @@ pub unsafe extern "C" fn pam_sm_close_session(
     argc: c_int,
     argv: *const *const c_char,
 ) -> c_int {
-    std::panic::catch_unwind(AssertUnwindSafe(|| {
+    match std::panic::catch_unwind(AssertUnwindSafe(|| {
         // SAFETY: forwards Linux-PAM's module arguments.
         unsafe { close_inner(pamh, argc, argv) }
-    }))
-    .unwrap_or(PAM_SESSION_ERR)
+    })) {
+        Ok(status) => status,
+        Err(_) => {
+            // SAFETY: forwarded live PAM handle.
+            unsafe { log_error(pamh, "panic while closing a session through pam_sessiond") };
+            PAM_SESSION_ERR
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failure_message_reaches_logger_unchanged() {
+        let mut logged = String::new();
+        emit_message(
+            "sessiond OpenSession for uid 1000: unavailable",
+            |message| {
+                logged = message.to_owned();
+            },
+        );
+        assert_eq!(logged, "sessiond OpenSession for uid 1000: unavailable");
+    }
 }

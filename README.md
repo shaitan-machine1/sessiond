@@ -7,6 +7,8 @@ Phase 1 session lifecycle stack:
   reconstruction and separate leader/scope escalation budgets;
 - `pam_sessiond`: Rust `cdylib` with hand-written libpam FFI, finite D-Bus
   timeout, PAM environment setup, PAM-data session ID and `fail_open`;
+  failures are reported with service context through `pam_syslog()` using a
+  constant format string;
 - `sessiond-user-launcher`: a dedicated single-threaded PAM/credential/process
   launcher tracked as target `manager`;
 - `user-service-manager`: s6/s6-rc entrypoint and a default per-user D-Bus
@@ -31,6 +33,7 @@ and use private D-Bus/cgroup state without a display, seat or VT:
 ```sh
 ./tests/root-e2e.sh
 ./tests/root-user-launcher-e2e.sh
+./tests/pam-syslog.sh
 ```
 
 `root-e2e.sh` builds the sibling scoped checkout (override with
@@ -38,6 +41,8 @@ and use private D-Bus/cgroup state without a display, seat or VT:
 and clean/unclean session teardown, and calls the installed build of
 `pam_sessiond` through a temporary PAM configuration. Both scripts require
 passwordless `sudo`; they return status 77 when prerequisites are unavailable.
+`pam-syslog.sh` interposes a test logger to verify that a system-bus failure
+reaches `pam_syslog()` with the literal `%s` format and contextual text.
 
 ## Install
 

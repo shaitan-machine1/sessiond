@@ -6,9 +6,9 @@ Phase 1 session lifecycle stack:
   idempotent `CloseSession`, `ListSessions`, lifecycle signals, restart
   reconstruction and separate leader/scope escalation budgets;
 - `pam_sessiond`: Rust `cdylib` with hand-written libpam FFI, finite D-Bus
-  timeout, PAM environment setup, PAM-data session ID and `fail_open`;
-  failures are reported with service context through `pam_syslog()` using a
-  constant format string;
+  timeout, `XDG_RUNTIME_DIR`/`XDG_SESSION_ID` PAM environment setup, PAM-data
+  session ID and `fail_open`; failures are reported with service context
+  through `pam_syslog()` using a constant format string;
 - `sessionctl`: readable system-bus client with public session inventory and
   root-authorized asynchronous close requests;
 - `sessiond-user-launcher`: a dedicated single-threaded PAM/credential/process
@@ -70,5 +70,8 @@ and the files under `dist/`:
 - the system s6 longrun, ordered after scoped and system D-Bus;
 - a compiled s6-rc database generated from `dist/s6-user/source`.
 
-Install `pam_sessiond` before modules consuming `XDG_RUNTIME_DIR`. See
+Install `pam_sessiond` before modules consuming `XDG_RUNTIME_DIR`, including
+`pam_env` when its configuration derives values from the runtime directory.
+`pam_sessiond` deliberately does not set the legacy `DBUS_SESSION_BUS_ADDRESS`;
+distributions or administrators may derive it in `pam_env.conf`. See
 `dist/pam/README.md`. Live TTY/SSH/SDDM verification remains M5 work.

@@ -168,12 +168,8 @@ unsafe fn open_inner(pamh: *mut PamHandle, argc: c_int, argv: *const *const c_ch
             run_async(open(uid, timeout)).map_err(|error| Failure::new(PAM_SESSION_ERR, error))?;
 
         let environment = [
-            ("XDG_RUNTIME_DIR", runtime.clone()),
+            ("XDG_RUNTIME_DIR", runtime),
             ("XDG_SESSION_ID", sid.clone()),
-            (
-                "DBUS_SESSION_BUS_ADDRESS",
-                format!("unix:path={runtime}/bus"),
-            ),
         ];
         for (name, value) in environment {
             let assignment = CString::new(format!("{name}={value}")).map_err(|_| {

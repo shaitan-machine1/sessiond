@@ -53,7 +53,8 @@ int main(int argc, char **argv) {
     if (status != PAM_SUCCESS) { fprintf(stderr, "open: %s\n", pam_strerror(handle, status)); pam_end(handle, status); return 2; }
     const char *sid = pam_getenv(handle, "XDG_SESSION_ID");
     const char *runtime = pam_getenv(handle, "XDG_RUNTIME_DIR");
-    if (sid == NULL || strlen(sid) != 32 || runtime == NULL) return 3;
+    const char *legacy_bus = pam_getenv(handle, "DBUS_SESSION_BUS_ADDRESS");
+    if (sid == NULL || strlen(sid) != 32 || runtime == NULL || legacy_bus != NULL) return 3;
     FILE *result = fopen(argv[2], "w");
     if (result == NULL) return 4;
     fprintf(result, "%s\n%s\n", sid, runtime);

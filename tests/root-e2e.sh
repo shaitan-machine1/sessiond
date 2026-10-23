@@ -158,8 +158,7 @@ if busctl --address="$address" call org.decoupling.sessiond1 \
     echo "non-root CloseSession unexpectedly succeeded" >&2
     exit 1
 fi
-grep -q 'CloseSession' "$work/nonroot-close.log"
-grep -q 'AccessDenied' "$work/nonroot-close.log"
+grep -q 'root-only' "$work/nonroot-close.log"
 [ "$(sudo find "/sys/fs/cgroup/$cgroup/sessiond/user/0/session" -mindepth 1 -maxdepth 1 -type d | wc -l)" -eq 2 ]
 [ "$(sudo cat "/sys/fs/cgroup/$cgroup/sessiond/user/0/service/cgroup.procs" | wc -l)" -eq 1 ]
 sudo kill -KILL "$first_pid"

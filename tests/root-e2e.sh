@@ -133,9 +133,10 @@ wait_name org.decoupling.scoped1
 sudo -E env DBUS_SYSTEM_BUS_ADDRESS="$address" "$repo/target/debug/sessiond" --bus system --config "$work/sessiond.conf" >"$work/sessiond.log" 2>&1 & sessiond_wrapper=$!
 wait_name org.decoupling.sessiond1
 
-# Session inventory is public and has an explicit empty state.
-empty_output=$(env DBUS_SYSTEM_BUS_ADDRESS="$address" "$repo/target/debug/sessionctl" list)
-[ "$empty_output" = "No sessions." ]
+# Session inventory is public and initially empty.
+empty_output=$(busctl --address="$address" call org.decoupling.sessiond1 \
+    /org/decoupling/sessiond1 org.decoupling.sessiond1.Manager ListSessions)
+[ "$empty_output" = "a(su) 0" ]
 
 # Two sessions share one user manager. Losing one tracked PAM host must only
 # remove that session; normal close of the last removes the manager/runtime.
@@ -149,12 +150,12 @@ result=$(busctl --address="$address" call org.decoupling.sessiond1 /org/decoupli
 echo "$result" | grep -q '^a(su) 2 '
 first_sid=$(sudo head -n 1 "$work/first.sid")
 second_sid=$(sudo head -n 1 "$work/second.sid")
-list_output=$(env DBUS_SYSTEM_BUS_ADDRESS="$address" "$repo/target/debug/sessionctl" list)
-echo "$list_output" | grep -q '^SESSION[[:space:]][[:space:]]*UID$'
-echo "$list_output" | grep -q "^$first_sid[[:space:]][[:space:]]*0$"
-echo "$list_output" | grep -q "^$second_sid[[:space:]][[:space:]]*0$"
-if env DBUS_SYSTEM_BUS_ADDRESS="$address" "$repo/target/debug/sessionctl" close "$first_sid" >"$work/nonroot-close.log" 2>&1; then
-    echo "non-root sessionctl close unexpectedly succeeded" >&2
+echo "$result" | grep -q "$first_sid"
+echo "$result" | grep -q "$second_sid"
+if busctl --address="$address" call org.decoupling.sessiond1 \
+    /org/decoupling/sessiond1 org.decoupling.sessiond1.Manager \
+    CloseSession s "$first_sid" >"$work/nonroot-close.log" 2>&1; then
+    echo "non-root CloseSession unexpectedly succeeded" >&2
     exit 1
 fi
 grep -q 'CloseSession' "$work/nonroot-close.log"
@@ -187,20 +188,21 @@ pam_pid= pam_wrapper=
 for _ in $(seq 1 200); do [ ! -e "$work/user/0" ] && break; sleep .05; done
 [ ! -e "$work/user/0" ]
 
-# Root can request asynchronous closure through sessionctl. The confirmation
-# identifies the session, and the daemon drains its disposable scope.
+# Root can request asynchronous closure through D-Bus, and the daemon drains
+# the disposable scope.
 sudo -E env DBUS_SYSTEM_BUS_ADDRESS="$address" "$repo/target/debug/examples/hold-session" 0 "$work/cli.sid" >"$work/cli-session.log" 2>&1 & cli_wrapper=$!
 wait_file "$work/cli.sid"
 cli_pid=$(pgrep -P "$cli_wrapper" -f hold-session)
 cli_sid=$(sudo head -n 1 "$work/cli.sid")
-close_output=$(sudo -E env DBUS_SYSTEM_BUS_ADDRESS="$address" "$repo/target/debug/sessionctl" close "$cli_sid")
-[ "$close_output" = "Closure requested for session $cli_sid." ]
+sudo busctl --address="$address" call org.decoupling.sessiond1 \
+    /org/decoupling/sessiond1 org.decoupling.sessiond1.Manager \
+    CloseSession s "$cli_sid" >/dev/null
 for _ in $(seq 1 200); do
     ! kill -0 "$cli_wrapper" 2>/dev/null && break
     sleep .05
 done
 if kill -0 "$cli_wrapper" 2>/dev/null; then
-    echo "timed out waiting for sessionctl close to drain $cli_sid" >&2
+    echo "timed out waiting for CloseSession to drain $cli_sid" >&2
     exit 1
 fi
 wait "$cli_wrapper" || true
@@ -211,6 +213,5 @@ for _ in $(seq 1 200); do
     sleep .05
 done
 echo "$result" | grep -q '^a(su) 0$'
-[ "$(env DBUS_SYSTEM_BUS_ADDRESS="$address" "$repo/target/debug/sessionctl" list)" = "No sessions." ]
 
-echo "sessiond root/private-D-Bus/scoped/PAM/sessionctl end-to-end tests passed"
+echo "sessiond root/private-D-Bus/scoped/PAM end-to-end tests passed"

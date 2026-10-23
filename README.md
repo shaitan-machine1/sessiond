@@ -9,8 +9,8 @@ Phase 1 session lifecycle stack:
   timeout, `XDG_RUNTIME_DIR`/`XDG_SESSION_ID` PAM environment setup, PAM-data
   session ID and `fail_open`; failures are reported with service context
   through `pam_syslog()` using a constant format string;
-- `sessionctl`: readable system-bus client with public session inventory and
-  root-authorized asynchronous close requests;
+- `sessiond-api`: typed zbus proxies and protocol constants for external
+  administrative clients;
 - `sessiond-user-launcher`: a dedicated single-threaded PAM/credential/process
   launcher tracked as target `manager`.
 
@@ -20,17 +20,10 @@ below. Sessiond does not ship an s6 graph or a user D-Bus service.
 The workspace pins `scope-id` from the exact SSH tag `v0.1.0` and uses
 zbus 6. UUIDv7 session IDs are lowercase 32-digit hex strings.
 
-Administrative client commands are:
-
-```sh
-sessionctl list
-sessionctl close SESSION_ID
-```
-
-`list` prints an aligned `SESSION`/`UID` table or `No sessions.`. `close`
-reports that closure was requested because daemon teardown is asynchronous and
-idempotent. The client uses only the system bus; sessiond's D-Bus policy and
-peer credentials, not the client, enforce authorization.
+Administrative presentation belongs to the separate unified `loginctl`
+repository. This repository intentionally ships no component-specific CLI;
+sessiond's D-Bus policy and peer credentials remain the authorization
+boundary.
 
 ## Build and test
 
@@ -85,7 +78,7 @@ The manager receives `HOME`, `USER`, `LOGNAME`, `SHELL`, `PATH`,
 
 ## Install
 
-Install `sessiond` and `sessionctl` under `/usr/bin`, the launcher under
+Install `sessiond` under `/usr/bin`, the launcher under
 `/usr/libexec/sessiond`, the PAM module in the distribution module directory,
 and the following files under `dist/`:
 

@@ -2,8 +2,8 @@
 members = [
   "crates/pam-ffi",
   "crates/pam-sessiond",
+  "crates/sessiond-api",
   "crates/sessiond",
-  "crates/sessionctl",
   "crates/sessiond-user-launcher",
 ]
 resolver = "2"
@@ -23,6 +23,7 @@ humantime = "2.3"
 libc = "0.2"
 nix = { version = "0.31", features = ["fs", "process", "signal", "user"] }
 pam-ffi = { path = "crates/pam-ffi" }
+sessiond-api = { path = "crates/sessiond-api" }
 scope-id = { git = "ssh://git@github.com/shaitan-machine1/scoped.git", tag = "v0.1.0" }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"

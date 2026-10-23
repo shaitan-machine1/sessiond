@@ -1,3 +1,4 @@
+pub use sessiond_api::{BUS_NAME, INTERFACE_NAME, OBJECT_PATH, SessionDescription};
 use std::sync::Arc;
 use zbus::Connection;
 use zbus::fdo;
@@ -6,10 +7,6 @@ use zbus::names::BusName;
 use zbus::object_server::SignalEmitter;
 
 use crate::manager::SessionManager;
-
-pub const BUS_NAME: &str = "org.decoupling.sessiond1";
-pub const OBJECT_PATH: &str = "/org/decoupling/sessiond1";
-pub const INTERFACE_NAME: &str = "org.decoupling.sessiond1.Manager";
 
 #[derive(Debug, zbus::DBusError)]
 #[zbus(prefix = "org.decoupling.sessiond1.Error")]
@@ -64,7 +61,7 @@ impl Manager {
             .map_err(|error| ManagerError::BackendFailure(error.to_string()))
     }
 
-    async fn list_sessions(&self) -> Vec<(String, u32)> {
+    async fn list_sessions(&self) -> Vec<SessionDescription> {
         self.manager.list_sessions().await
     }
 

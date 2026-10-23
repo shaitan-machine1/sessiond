@@ -10,7 +10,7 @@ pub enum ShutdownMode {
 }
 
 #[derive(Clone, Debug, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ShutdownConfig {
     pub mode: ShutdownMode,
     #[serde(deserialize_with = "duration")]
@@ -30,7 +30,7 @@ impl Default for ShutdownConfig {
 }
 
 #[derive(Clone, Debug, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct SessionConfig {
     #[serde(deserialize_with = "duration")]
     pub open_timeout: Duration,
@@ -47,11 +47,10 @@ impl Default for SessionConfig {
 }
 
 #[derive(Clone, Debug, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ManagerConfig {
     pub shutdown: ShutdownConfig,
     pub launcher: PathBuf,
-    pub entrypoint: PathBuf,
     #[serde(deserialize_with = "duration")]
     pub ready_timeout: Duration,
 }
@@ -66,14 +65,13 @@ impl Default for ManagerConfig {
         Self {
             shutdown,
             launcher: "/usr/libexec/sessiond/sessiond-user-launcher".into(),
-            entrypoint: "/usr/libexec/sessiond/user-service-manager".into(),
             ready_timeout: Duration::from_secs(30),
         }
     }
 }
 
 #[derive(Clone, Debug, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub session: SessionConfig,
     pub user_service_manager: ManagerConfig,
@@ -133,10 +131,6 @@ impl Config {
             self.user_service_manager.launcher.is_absolute(),
             "user manager launcher must be absolute"
         );
-        anyhow::ensure!(
-            self.user_service_manager.entrypoint.is_absolute(),
-            "user manager entrypoint must be absolute"
-        );
         Ok(())
     }
 }
@@ -176,5 +170,17 @@ mod tests {
             config.user_service_manager.shutdown.leader_timeout,
             Duration::from_secs(4)
         );
+    }
+
+    #[test]
+    fn rejects_removed_manager_entrypoint_setting() {
+        let error = toml::from_str::<Config>(
+            r#"
+            [user_service_manager]
+            entrypoint = "/tmp/manager"
+            "#,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("entrypoint"));
     }
 }

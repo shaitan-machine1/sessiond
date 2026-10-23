@@ -65,17 +65,14 @@ fn main() -> anyhow::Result<()> {
         .env("PATH", "/usr/local/bin:/usr/bin:/bin")
         .env("XDG_CONFIG_HOME", user.dir.join(".config"))
         .env("XDG_RUNTIME_DIR", &args.runtime_dir)
-        .env(
-            "DBUS_SESSION_BUS_ADDRESS",
-            format!("unix:path={}/bus", args.runtime_dir.display()),
-        )
-        .env("SESSIOND_READY_FD", "5");
+        .arg("--ready-fd")
+        .arg("3");
     // SAFETY: this dedicated launcher is single-threaded. The operations are
     // precisely the child credential/process-group setup before exec.
     unsafe {
         command.pre_exec(move || {
-            if libc::dup2(readiness_write_raw, 5) == -1
-                || libc::fcntl(5, libc::F_SETFD, 0) == -1
+            if libc::dup2(readiness_write_raw, 3) == -1
+                || libc::fcntl(3, libc::F_SETFD, 0) == -1
                 || libc::setpgid(0, 0) == -1
                 || libc::initgroups(username_c.as_ptr(), gid) == -1
                 || libc::setgid(gid) == -1
@@ -113,7 +110,9 @@ fn main() -> anyhow::Result<()> {
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    anyhow::ensure!(byte[0] == 1, "invalid user-manager readiness byte");
+    drop(readiness_read);
+    // The manager protocol deliberately treats the first byte as opaque and
+    // closes without draining any later payload.
     // SAFETY: fd 4 is the readiness channel installed by sessiond.
     let mut outer_ready = unsafe { File::from_raw_fd(4) };
     outer_ready.write_all(&[1])?;

@@ -21,12 +21,22 @@ printf 'session required pam_permit.so\n' | sudo tee "/etc/pam.d/$pam_service" >
 cat >"$work/entrypoint" <<'EOF'
 #!/bin/sh
 set -eu
-eval "printf '\001' >&$SESSIOND_READY_FD"
-eval "exec $SESSIOND_READY_FD>&-"
+[ "$#" -eq 2 ] && [ "$1" = "--ready-fd" ] && [ "$2" = 3 ] || exit 64
+[ "${SESSIOND_READY_FD+x}" != x ] || exit 65
+[ "${DBUS_SESSION_BUS_ADDRESS+x}" != x ] || exit 66
+printf 'R' >&3
+exec 3>&-
 trap 'exit 0' TERM INT HUP
 while :; do sleep 1; done
 EOF
 chmod +x "$work/entrypoint"
+cat >"$work/eof-entrypoint" <<'EOF'
+#!/bin/sh
+set -eu
+[ "$#" -eq 2 ] && [ "$1" = "--ready-fd" ] && [ "$2" = 3 ] || exit 64
+exit 0
+EOF
+chmod +x "$work/eof-entrypoint"
 cat >"$work/harness.c" <<'EOF'
 #include <signal.h>
 #include <stdlib.h>
@@ -60,4 +70,8 @@ int main(int argc, char **argv) {
 EOF
 cc "$work/harness.c" -o "$work/harness"
 sudo "$work/harness" "$repo/target/debug/sessiond-user-launcher" "$work/entrypoint" "$pam_service"
+if sudo "$work/harness" "$repo/target/debug/sessiond-user-launcher" "$work/eof-entrypoint" "$pam_service"; then
+    echo "launcher accepted EOF before manager readiness" >&2
+    exit 1
+fi
 echo "sessiond-user-launcher end-to-end test passed"

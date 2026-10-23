@@ -68,7 +68,7 @@ EOF
 cc "$work/pam-app.c" -lpam -o "$work/pam-app"
 mkdir "$work/pam.d"
 printf 'session required %s timeout=5s\n' "$repo/target/debug/libpam_sessiond.so" >"$work/pam.d/sessiond-e2e"
-cat >"$work/sessiond.toml" <<EOF
+cat >"$work/sessiond.conf" <<EOF
 runtime_parent = "$work/user"
 state_dir = "$work/state"
 linger = false
@@ -80,7 +80,6 @@ leader_timeout = "100ms"
 scope_timeout = "1s"
 [user_service_manager]
 launcher = "$work/test-launcher"
-entrypoint = "$work/unused"
 ready_timeout = "5s"
 [user_service_manager.shutdown]
 mode = "leader"
@@ -131,7 +130,7 @@ wait_file() {
 sudo mkdir "/sys/fs/cgroup/$cgroup"
 sudo -E env DBUS_SYSTEM_BUS_ADDRESS="$address" "$scoped_repo/target/debug/scoped" --bus system --scope-root "$cgroup" >"$work/scoped.log" 2>&1 & scoped_wrapper=$!
 wait_name org.decoupling.scoped1
-sudo -E env DBUS_SYSTEM_BUS_ADDRESS="$address" "$repo/target/debug/sessiond" --bus system --config "$work/sessiond.toml" >"$work/sessiond.log" 2>&1 & sessiond_wrapper=$!
+sudo -E env DBUS_SYSTEM_BUS_ADDRESS="$address" "$repo/target/debug/sessiond" --bus system --config "$work/sessiond.conf" >"$work/sessiond.log" 2>&1 & sessiond_wrapper=$!
 wait_name org.decoupling.sessiond1
 
 # Session inventory is public and has an explicit empty state.

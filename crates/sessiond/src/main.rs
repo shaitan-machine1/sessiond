@@ -18,7 +18,7 @@ enum Bus {
 
 #[derive(Debug, Parser)]
 struct Args {
-    #[arg(long, default_value = "/etc/sessiond/sessiond.toml")]
+    #[arg(long, default_value = "/etc/sessiond.conf")]
     config: PathBuf,
     #[arg(long, value_enum, default_value = "system", hide = true)]
     bus: Bus,
@@ -53,7 +53,6 @@ async fn main() -> anyhow::Result<()> {
     let launcher = Arc::new(RealLauncher::new(
         scoped.clone(),
         config.user_service_manager.launcher.clone(),
-        config.user_service_manager.entrypoint.clone(),
         config.user_service_manager.ready_timeout,
     ));
     let manager = SessionManager::new(scoped.clone(), runtime, launcher, config);

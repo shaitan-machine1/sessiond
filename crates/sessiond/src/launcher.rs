@@ -10,6 +10,11 @@ use std::time::Duration;
 
 use crate::scoped::ScopedApi;
 
+pub const USER_SERVICE_MANAGER: &str = match option_env!("SESSIOND_USER_SERVICE_MANAGER") {
+    Some(path) => path,
+    None => "/usr/libexec/user-service-manager",
+};
+
 #[async_trait]
 pub trait UserManagerLauncher: Send + Sync {
     async fn start(&self, uid: u32, runtime: &Path, scope: &str) -> anyhow::Result<()>;
@@ -18,21 +23,14 @@ pub trait UserManagerLauncher: Send + Sync {
 pub struct RealLauncher {
     scoped: Arc<dyn ScopedApi>,
     launcher: PathBuf,
-    entrypoint: PathBuf,
     ready_timeout: Duration,
 }
 
 impl RealLauncher {
-    pub fn new(
-        scoped: Arc<dyn ScopedApi>,
-        launcher: PathBuf,
-        entrypoint: PathBuf,
-        ready_timeout: Duration,
-    ) -> Self {
+    pub fn new(scoped: Arc<dyn ScopedApi>, launcher: PathBuf, ready_timeout: Duration) -> Self {
         Self {
             scoped,
             launcher,
-            entrypoint,
             ready_timeout,
         }
     }
@@ -52,7 +50,7 @@ impl UserManagerLauncher for RealLauncher {
             .arg("--runtime-dir")
             .arg(runtime)
             .arg("--entrypoint")
-            .arg(&self.entrypoint);
+            .arg(USER_SERVICE_MANAGER);
         // SAFETY: this closure invokes only async-signal-safe dup2 between fork
         // and exec. All allocation and argument construction happened above.
         unsafe {

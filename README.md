@@ -12,9 +12,10 @@ Phase 1 session lifecycle stack:
 - `sessionctl`: readable system-bus client with public session inventory and
   root-authorized asynchronous close requests;
 - `sessiond-user-launcher`: a dedicated single-threaded PAM/credential/process
-  launcher tracked as target `manager`;
-- `user-service-manager`: s6/s6-rc entrypoint and a default per-user D-Bus
-  longrun.
+  launcher tracked as target `manager`.
+
+The user service manager is a separate package implementing the interface
+below. Sessiond does not ship an s6 graph or a user D-Bus service.
 
 The workspace pins `scope-id` from the exact SSH tag `v0.1.0` and uses
 zbus 6. UUIDv7 session IDs are lowercase 32-digit hex strings.
@@ -58,17 +59,42 @@ passwordless `sudo`; they return status 77 when prerequisites are unavailable.
 `pam-syslog.sh` interposes a test logger to verify that a system-bus failure
 reaches `pam_syslog()` with the literal `%s` format and contextual text.
 
+## User service manager interface
+
+The manager executable path is selected at build time with the
+`SESSIOND_USER_SERVICE_MANAGER` build environment variable and defaults to
+`/usr/libexec/user-service-manager`. It is not configurable through the daemon
+configuration or runtime environment.
+
+After its private PAM and credential setup, `sessiond-user-launcher` invokes:
+
+```text
+/usr/libexec/user-service-manager --ready-fd 3
+```
+
+The manager remains in the foreground for the lifetime of its service graph.
+It writes one readiness byte of any value to fd 3. The launcher reads exactly
+one byte, retries interrupted reads, treats EOF or read failure as startup
+failure, and closes the pipe immediately without draining. Sessiond enforces
+the configured readiness timeout around the privileged launcher. The manager
+must handle `SIGTERM` by stopping its graph and exiting.
+
+The manager receives `HOME`, `USER`, `LOGNAME`, `SHELL`, `PATH`,
+`XDG_CONFIG_HOME`, and `XDG_RUNTIME_DIR`. The launcher does not synthesize
+`DBUS_SESSION_BUS_ADDRESS` or pass `SESSIOND_READY_FD`.
+
 ## Install
 
 Install `sessiond` and `sessionctl` under `/usr/bin`, the launcher under
 `/usr/libexec/sessiond`, the PAM module in the distribution module directory,
-and the files under `dist/`:
+and the following files under `dist/`:
 
 - D-Bus policy `org.decoupling.sessiond1.conf`;
-- `/etc/sessiond/sessiond.toml`;
-- `/etc/pam.d/sessiond-user` (must not recurse into `pam_sessiond`/`pam_aclad`);
-- the system s6 longrun, ordered after scoped and system D-Bus;
-- a compiled s6-rc database generated from `dist/s6-user/source`.
+- `/etc/sessiond.conf`;
+- `/etc/pam.d/sessiond-user` (must not recurse into `pam_sessiond`/`pam_aclad`).
+
+The Artix system service definition and the selected user service manager are
+packaged separately.
 
 Install `pam_sessiond` before modules consuming `XDG_RUNTIME_DIR`, including
 `pam_env` when its configuration derives values from the runtime directory.

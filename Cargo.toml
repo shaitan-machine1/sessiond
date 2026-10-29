@@ -1,8 +1,9 @@
 [workspace]
 members = [
+  "crates/lib-scoped",
+  "crates/lib-sessiond",
   "crates/pam-ffi",
   "crates/pam-sessiond",
-  "crates/sessiond-api",
   "crates/sessiond",
   "crates/sessiond-user-launcher",
 ]
@@ -16,20 +17,18 @@ rust-version = "1.89"
 
 [workspace.dependencies]
 anyhow = "1.0"
-async-trait = "0.1"
 clap = { version = "4.5", features = ["derive"] }
-futures-util = "0.3"
+dbus = "0.9.12"
+dbus-crossroads = "0.5.3"
 humantime = "2.3"
 libc = "0.2"
-nix = { version = "0.31", features = ["fs", "process", "signal", "user"] }
+nix = { version = "0.31", features = ["fs", "poll", "process", "signal", "user"] }
+lib-scoped = { path = "crates/lib-scoped" }
+lib-sessiond = { path = "crates/lib-sessiond" }
 pam-ffi = { path = "crates/pam-ffi" }
-sessiond-api = { path = "crates/sessiond-api" }
-scope-id = { git = "ssh://git@github.com/shaitan-machine1/scoped.git", tag = "v0.1.0" }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
-tokio = { version = "1.48", features = ["macros", "rt", "signal", "sync", "time", "process", "io-util"] }
 toml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1.18", features = ["v7"] }
-zbus = { version = "6.0.0", features = ["tokio"] }

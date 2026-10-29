@@ -60,11 +60,10 @@ printf 'session required %s fail_open timeout=50ms\n' \
 capture="$work/syslog"
 PAM_SYSLOG_CAPTURE="$capture" \
 LD_PRELOAD="$work/shim.so" \
-DBUS_SYSTEM_BUS_ADDRESS="unix:path=$work/missing-bus" \
     "$work/app" "$(id -un)" "$work/pam.d"
 
 grep -Fx 'format=%s' "$capture"
-grep -E '^message=connect to the system bus for OpenSession: ' "$capture"
+grep -Fx 'message=session mutation requires effective UID 0' "$capture"
 if grep -q 'pam_sessiond:' "$capture"; then
     echo "legacy stderr prefix unexpectedly reached pam_syslog" >&2
     exit 1

@@ -1,96 +1,104 @@
 # sessiond
 
-Phase 1 session lifecycle stack:
+Synchronous session lifecycle and daemonless cgroup-v2 containment.
 
-- `sessiond`: root system-bus service implementing `OpenSession`, asynchronous
-  idempotent `CloseSession`, `ListSessions`, lifecycle signals, restart
-  reconstruction and separate leader/scope escalation budgets;
-- `pam_sessiond`: Rust `cdylib` with hand-written libpam FFI, finite D-Bus
-  timeout, `XDG_RUNTIME_DIR`/`XDG_SESSION_ID` PAM environment setup, PAM-data
-  session ID and `fail_open`; failures are reported with service context
-  through `pam_syslog()` using a constant format string;
-- `sessiond-api`: typed zbus proxies and protocol constants for external
-  administrative clients;
-- `sessiond-user-launcher`: a dedicated single-threaded PAM/credential/process
-  launcher tracked as target `manager`.
+## Workspace
 
-The user service manager is a separate package implementing the interface
-below. Sessiond does not ship an s6 graph or a user D-Bus service.
+- `lib-scoped`: explicit containment domains, tracked process identities,
+  signalling, subtree termination, and caller-owned blocking observation. It
+  has no D-Bus, locks, hidden threads, or automatic cleanup.
+- `lib-sessiond`: per-UID file locking, containment-derived inventory, local PAM
+  open, secure runtime handling, launcher coordination, synchronous D-Bus
+  clients/signals, and the daemon's complete teardown algorithm.
+- `pam_sessiond`: opens locally through `lib-sessiond`; on close it resolves its
+  current containment and asks the daemon to schedule teardown.
+- `sessiond`: blocking `dbus`/`dbus-crossroads` service with bounded cleanup and
+  reply workers plus one multi-watch observer thread.
+- `sessiond-user-launcher`: detached manager PAM host and manager child reaper.
+- `pam-ffi`: shared minimal Linux-PAM bindings.
 
-The workspace pins `scope-id` from the exact SSH tag `v0.1.0` and uses
-zbus 6. UUIDv7 session IDs are lowercase 32-digit hex strings.
+`pam_sessiond` accepts `fail_open`, `timeout=DURATION`, and an absolute
+`config=PATH` override (the default is `/etc/sessiond.conf`). The saved SID is
+convenience only; close always resolves the caller's current containment.
 
-Administrative presentation belongs to the separate unified `loginctl`
-repository. This repository intentionally ships no component-specific CLI;
-sessiond's D-Bus policy and peer credentials remain the authorization
-boundary.
+There is no scoped daemon or `OpenSession` RPC. Authoritative session state is:
+
+```text
+sessiond/user/<uid>/session/<sid>
+sessiond/user/<uid>/service
+```
+
+Inventory is lock-free and reports SID, UID, and the recorded leader identity
+without probing liveness. Startup discovery is read-only and never sweeps old
+state. Close scheduling/coalescing and completion results exist only in daemon
+memory.
+
+## D-Bus
+
+The retained interface is:
+
+```text
+org.decoupling.sessiond1
+/org/decoupling/sessiond1
+org.decoupling.sessiond1.Manager
+```
+
+Methods:
+
+- `CloseSession`: scheduling-only compatibility method;
+- `ScheduleCloseSession`: scheduling-only;
+- `CloseSessionAndWait`: blocking administrative completion;
+- `ListSessions`: legacy SID/UID adapter over containment inventory.
+
+Mutating methods verify root bus credentials. `SessionNew` may be sent directly
+by a root PAM connection, while `SessionRemoved` is sent by daemon cleanup.
+Listeners must match type/interface/path/member without a sender constraint.
+
+## Manager startup
+
+A new manager is launched only when no recorded live `manager` PAM host can be
+reused. The launcher pins the service-scope generation, detaches after exec,
+self-migrates, separately assigns target `manager`, opens its private PAM
+session, starts the configured manager as the target user, and reports one-byte
+manager readiness. The original PAM host reaps only the short-lived helper.
+
+The manager executable is selected at build time with
+`SESSIOND_USER_SERVICE_MANAGER` and defaults to
+`/usr/libexec/user-service-manager`. It is invoked as:
+
+```text
+user-service-manager --ready-fd 3
+```
+
+The private PAM service defaults to `sessiond-user` and is configurable as
+`user_service_manager.pam_service`. No user bus address is synthesized.
 
 ## Build and test
 
 ```sh
+cargo fmt --all -- --check
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
-cargo fmt --all -- --check
 ```
 
-Unit tests use fake scoped/runtime/launcher backends, including two concurrent
-sessions sharing one manager, last-session cleanup, shutdown ordering and
-unsafe runtime-path rejection. Root-required end-to-end tests are committed
-and use private D-Bus/cgroup state without a display, seat or VT:
+Real cgroup tests for `lib-scoped` are opt-in and require an explicitly
+throwaway delegated parent:
+
+```sh
+LIB_SCOPED_TEST_ROOT=/sys/fs/cgroup/DISPOSABLE_PARENT \
+  cargo test -p lib-scoped --test cgroup -- --ignored
+```
+
+Root integration tests use a private bus and disposable cgroup tree. The main
+scenario covers concurrent opens, daemon restart with stale initial discovery,
+leader-exit observation, optional-PAM manager-start failure, scheduled PAM
+close, and blocking administrative close:
 
 ```sh
 ./tests/root-e2e.sh
-./tests/root-user-launcher-e2e.sh
 ./tests/pam-syslog.sh
 ```
 
-`root-e2e.sh` builds the sibling scoped checkout (override with
-`SCOPED_REPO=/path/to/scoped`), exercises real cgroup migration, shared-manager
-and clean/unclean session teardown, and calls the installed build of
-`pam_sessiond` through a temporary PAM configuration. Both scripts require
-passwordless `sudo`; they return status 77 when prerequisites are unavailable.
-`pam-syslog.sh` interposes a test logger to verify that a system-bus failure
-reaches `pam_syslog()` with the literal `%s` format and contextual text.
-
-## User service manager interface
-
-The manager executable path is selected at build time with the
-`SESSIOND_USER_SERVICE_MANAGER` build environment variable and defaults to
-`/usr/libexec/user-service-manager`. It is not configurable through the daemon
-configuration or runtime environment.
-
-After its private PAM and credential setup, `sessiond-user-launcher` invokes:
-
-```text
-/usr/libexec/user-service-manager --ready-fd 3
-```
-
-The manager remains in the foreground for the lifetime of its service graph.
-It writes one readiness byte of any value to fd 3. The launcher reads exactly
-one byte, retries interrupted reads, treats EOF or read failure as startup
-failure, and closes the pipe immediately without draining. Sessiond enforces
-the configured readiness timeout around the privileged launcher. The manager
-must handle `SIGTERM` by stopping its graph and exiting.
-
-The manager receives `HOME`, `USER`, `LOGNAME`, `SHELL`, `PATH`,
-`XDG_CONFIG_HOME`, and `XDG_RUNTIME_DIR`. The launcher does not synthesize
-`DBUS_SESSION_BUS_ADDRESS` or pass `SESSIOND_READY_FD`.
-
-## Install
-
-Install `sessiond` under `/usr/bin`, the launcher under
-`/usr/libexec/sessiond`, the PAM module in the distribution module directory,
-and the following files under `dist/`:
-
-- D-Bus policy `org.decoupling.sessiond1.conf`;
-- `/etc/sessiond.conf`;
-- `/etc/pam.d/sessiond-user` (must not recurse into `pam_sessiond`/`pam_aclad`).
-
-The Artix system service definition and the selected user service manager are
-packaged separately.
-
-Install `pam_sessiond` before modules consuming `XDG_RUNTIME_DIR`, including
-`pam_env` when its configuration derives values from the runtime directory.
-`pam_sessiond` deliberately does not set the legacy `DBUS_SESSION_BUS_ADDRESS`;
-distributions or administrators may derive it in `pam_env.conf`. See
-`dist/pam/README.md`. Live TTY/SSH/SDDM verification remains M5 work.
+They require passwordless `sudo`; missing prerequisites return status 77.
+Distribution service/activation cutover is intentionally outside this source
+migration.

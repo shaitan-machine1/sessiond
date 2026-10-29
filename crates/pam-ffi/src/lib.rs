@@ -56,6 +56,7 @@ unsafe extern "C" {
     fn pam_get_user(pamh: *mut PamHandle, user: *mut *const c_char, prompt: *const c_char)
     -> c_int;
     fn pam_putenv(pamh: *mut PamHandle, name_value: *const c_char) -> c_int;
+    fn pam_getenv(pamh: *mut PamHandle, name: *const c_char) -> *const c_char;
     fn pam_set_data(
         pamh: *mut PamHandle,
         module_data_name: *const c_char,
@@ -103,6 +104,23 @@ pub unsafe fn get_user(pamh: *mut PamHandle) -> Result<String, c_int> {
     Ok(unsafe { CStr::from_ptr(user) }
         .to_string_lossy()
         .into_owned())
+}
+
+/// # Safety
+/// `pamh` must be live. Returned storage is copied before returning.
+pub unsafe fn get_env(pamh: *mut PamHandle, name: &CStr) -> Option<String> {
+    // SAFETY: live handle and valid NUL-terminated environment name.
+    let value = unsafe { pam_getenv(pamh, name.as_ptr()) };
+    if value.is_null() {
+        None
+    } else {
+        // SAFETY: Linux-PAM returned a transaction-owned NUL-terminated value.
+        Some(
+            unsafe { CStr::from_ptr(value) }
+                .to_string_lossy()
+                .into_owned(),
+        )
+    }
 }
 
 /// # Safety

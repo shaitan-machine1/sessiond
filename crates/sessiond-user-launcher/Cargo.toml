@@ -9,5 +9,7 @@ rust-version.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 libc.workspace = true
+lib-scoped.workspace = true
+lib-sessiond.workspace = true
 nix.workspace = true
 pam-ffi.workspace = true

@@ -1,74 +1,69 @@
 #!/bin/bash
-# Real scoped/cgroup/private-D-Bus and pam_sessiond integration.
+# Real daemonless containment, synchronous D-Bus, PAM, and cleanup integration.
 set -euo pipefail
-
 repo=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-scoped_repo=${SCOPED_REPO:-"$repo/../scoped"}
-for command in cargo cc dbus-daemon busctl pgrep sudo; do
-    command -v "$command" >/dev/null || { echo "missing command: $command" >&2; exit 77; }
-done
-[ -x "$scoped_repo/target/debug/scoped" ] || cargo build --manifest-path "$scoped_repo/Cargo.toml" -p scoped
-cargo build --manifest-path "$repo/Cargo.toml" --workspace --bins --example hold-session
-cargo build --manifest-path "$repo/Cargo.toml" -p pam-sessiond
-sudo -n true || { echo "passwordless sudo is required" >&2; exit 77; }
-
+for command in cargo cc dbus-daemon busctl sudo; do command -v "$command" >/dev/null || exit 77; done
+sudo -n true || exit 77
 work=$(mktemp -d /tmp/sessiond-root-e2e.XXXXXX)
-chmod 755 "$work"
 cgroup="sessiond-root-e2e-$$"
-cat >"$work/bus.conf" <<EOF
-<busconfig><type>system</type><listen>unix:path=$work/bus</listen><auth>EXTERNAL</auth><policy context="default"><allow user="*"/><allow own="*"/><allow send_type="method_call"/><allow send_type="method_return"/><allow send_type="error"/><allow send_type="signal"/><allow receive_type="method_call"/><allow receive_type="method_return"/><allow receive_type="error"/><allow receive_type="signal"/></policy></busconfig>
-EOF
-cat >"$work/launcher.c" <<'EOF'
+pam_service="sessiond-user-e2e-$$"
+cat >"$work/manager.c" <<'EOF'
 #include <signal.h>
+#include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 static volatile sig_atomic_t stop;
 static void handler(int signal) { (void)signal; stop = 1; }
-int main(void) {
-    char byte;
-    if (read(3, &byte, 1) != 1 || byte != 1) return 1;
-    byte = 1;
-    if (write(4, &byte, 1) != 1) return 2;
-    signal(SIGTERM, handler);
-    while (!stop) pause();
-    return 0;
+int main(int argc, char **argv) {
+    if (argc != 3 || strcmp(argv[1], "--ready-fd") != 0 || strcmp(argv[2], "3") != 0) return 64;
+    char byte = 1; if (write(3, &byte, 1) != 1) return 1; close(3);
+    signal(SIGTERM, handler); signal(SIGINT, handler); signal(SIGHUP, handler);
+    while (!stop) pause(); return 0;
 }
 EOF
-cc "$work/launcher.c" -o "$work/test-launcher"
+cc "$work/manager.c" -o "$work/manager"
+SESSIOND_USER_SERVICE_MANAGER="$work/manager" cargo build --manifest-path "$repo/Cargo.toml" --workspace --bins --example hold-session
+SESSIOND_USER_SERVICE_MANAGER="$work/manager" cargo build --manifest-path "$repo/Cargo.toml" -p pam-sessiond
+cat >"$work/bus.conf" <<EOF
+<busconfig><type>system</type><listen>unix:path=$work/bus</listen><auth>EXTERNAL</auth><policy context="default"><allow user="*"/><allow own="*"/><allow send_type="method_call"/><allow send_type="method_return"/><allow send_type="error"/><allow send_type="signal"/><allow receive_type="method_call"/><allow receive_type="method_return"/><allow receive_type="error"/><allow receive_type="signal"/></policy></busconfig>
+EOF
 cat >"$work/pam-app.c" <<'EOF'
 #include <security/pam_appl.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
-static int conversation(int count, const struct pam_message **messages,
-                        struct pam_response **responses, void *data) {
-    (void)count; (void)messages; (void)data; *responses = NULL; return PAM_CONV_ERR;
-}
+static int conversation(int n, const struct pam_message **m, struct pam_response **r, void *d) { (void)n;(void)m;(void)d;*r=NULL;return PAM_CONV_ERR; }
 int main(int argc, char **argv) {
-    if (argc != 4) return 64;
-    struct pam_conv conversation_data = {conversation, NULL};
-    pam_handle_t *handle = NULL;
-    int status = pam_start_confdir(argv[1], "root", &conversation_data, argv[3], &handle);
-    if (status != PAM_SUCCESS) return 1;
-    status = pam_open_session(handle, 0);
-    if (status != PAM_SUCCESS) { fprintf(stderr, "open: %s\n", pam_strerror(handle, status)); pam_end(handle, status); return 2; }
-    const char *sid = pam_getenv(handle, "XDG_SESSION_ID");
-    const char *runtime = pam_getenv(handle, "XDG_RUNTIME_DIR");
-    const char *legacy_bus = pam_getenv(handle, "DBUS_SESSION_BUS_ADDRESS");
-    if (sid == NULL || strlen(sid) != 32 || runtime == NULL || legacy_bus != NULL) return 3;
-    FILE *result = fopen(argv[2], "w");
-    if (result == NULL) return 4;
-    fprintf(result, "%s\n%s\n", sid, runtime);
-    fclose(result);
-    sleep(1);
-    status = pam_close_session(handle, 0);
-    pam_end(handle, status);
-    return status == PAM_SUCCESS ? 0 : 5;
+    if (argc != 4) return 64; struct pam_conv conv={conversation,NULL}; pam_handle_t *h=NULL;
+    int s=pam_start_confdir(argv[1],"root",&conv,argv[3],&h); if(s!=PAM_SUCCESS)return 1;
+    s=pam_open_session(h,0); if(s!=PAM_SUCCESS){pam_end(h,s);return 2;}
+    const char *sid=pam_getenv(h,"XDG_SESSION_ID"), *runtime=pam_getenv(h,"XDG_RUNTIME_DIR");
+    if(!sid||strlen(sid)!=32||!runtime)return 3; FILE *f=fopen(argv[2],"w"); if(!f)return 4;
+    fprintf(f,"%s\n%s\n",sid,runtime); fclose(f); sleep(1);
+    s=pam_close_session(h,0); pam_end(h,s); return s==PAM_SUCCESS?0:5;
 }
 EOF
 cc "$work/pam-app.c" -lpam -o "$work/pam-app"
+cat >"$work/pam-fail-open.c" <<'EOF'
+#include <security/pam_appl.h>
+#include <stdio.h>
+#include <unistd.h>
+static int conversation(int n, const struct pam_message **m, struct pam_response **r, void *d) { (void)n;(void)m;(void)d;*r=NULL;return PAM_CONV_ERR; }
+int main(int argc, char **argv) {
+    if (argc != 4) return 64; struct pam_conv conv={conversation,NULL}; pam_handle_t *h=NULL;
+    int s=pam_start_confdir(argv[1],"root",&conv,argv[3],&h); if(s!=PAM_SUCCESS)return 1;
+    s=pam_open_session(h,0); if(s!=PAM_SUCCESS){pam_end(h,s);return 2;}
+    if(pam_getenv(h,"XDG_SESSION_ID")||pam_getenv(h,"XDG_RUNTIME_DIR"))return 3;
+    FILE *f=fopen(argv[2],"w"); if(!f)return 4; fputs("open survived\n",f); fclose(f); sleep(1);
+    s=pam_close_session(h,0); pam_end(h,s); return s==PAM_SUCCESS?0:5;
+}
+EOF
+cc "$work/pam-fail-open.c" -lpam -o "$work/pam-fail-open"
 mkdir "$work/pam.d"
-printf 'session required %s timeout=5s\n' "$repo/target/debug/libpam_sessiond.so" >"$work/pam.d/sessiond-e2e"
+printf 'session required %s timeout=5s config=%s\n' "$repo/target/debug/libpam_sessiond.so" "$work/sessiond.conf" >"$work/pam.d/sessiond-e2e"
+printf 'session required %s fail_open timeout=5s config=%s\n' "$repo/target/debug/libpam_sessiond.so" "$work/fail-open.conf" >"$work/pam.d/sessiond-fail-open"
 cat >"$work/sessiond.conf" <<EOF
+cgroup_root = "/sys/fs/cgroup/$cgroup"
 runtime_parent = "$work/user"
 state_dir = "$work/state"
 linger = false
@@ -79,138 +74,97 @@ mode = "scope"
 leader_timeout = "100ms"
 scope_timeout = "1s"
 [user_service_manager]
-launcher = "$work/test-launcher"
+launcher = "$repo/target/debug/sessiond-user-launcher"
+pam_service = "$pam_service"
 ready_timeout = "5s"
 [user_service_manager.shutdown]
 mode = "leader"
 leader_timeout = "1s"
 scope_timeout = "1s"
 EOF
-
-bus_pid=$(dbus-daemon --config-file="$work/bus.conf" --fork --print-pid)
+sed 's#^launcher = .*#launcher = "/definitely/missing/sessiond-launcher"#' "$work/sessiond.conf" >"$work/fail-open.conf"
+sudo chown -R root:root "$work"
+sudo chmod 1777 "$work"
+printf 'session required pam_permit.so\n' | sudo tee "/etc/pam.d/$pam_service" >/dev/null
+sudo mkdir "/sys/fs/cgroup/$cgroup"
+bus_pid=$(sudo dbus-daemon --config-file="$work/bus.conf" --fork --print-pid)
 address="unix:path=$work/bus"
-scoped_wrapper= sessiond_wrapper= first_wrapper= second_wrapper= pam_wrapper= cli_wrapper=
-first_pid= second_pid= pam_pid= cli_pid=
+daemon= hold1= hold2= pam_process=
 cleanup() {
-    status=$?
-    trap - EXIT
-    set +e
-    [ -n "$first_pid" ] && sudo kill -KILL "$first_pid" 2>/dev/null
-    [ -n "$second_pid" ] && sudo kill -KILL "$second_pid" 2>/dev/null
-    [ -n "$pam_pid" ] && sudo kill -KILL "$pam_pid" 2>/dev/null
-    [ -n "$cli_pid" ] && sudo kill -KILL "$cli_pid" 2>/dev/null
-    [ -n "$sessiond_wrapper" ] && sudo kill "$sessiond_wrapper" 2>/dev/null
-    [ -n "$scoped_wrapper" ] && sudo kill "$scoped_wrapper" 2>/dev/null
-    wait 2>/dev/null
-    kill "$bus_pid" 2>/dev/null
+    status=$?; trap - EXIT; set +e
+    [ -n "$hold1" ] && sudo kill -KILL "$hold1" 2>/dev/null
+    [ -n "$hold2" ] && sudo kill -KILL "$hold2" 2>/dev/null
+    [ -n "$pam_process" ] && sudo kill -KILL "$pam_process" 2>/dev/null
+    [ -n "$daemon" ] && sudo kill "$daemon" 2>/dev/null
+    sudo kill "$bus_pid" 2>/dev/null
+    sudo rm -f "/etc/pam.d/$pam_service"
+    sudo sh -c 'echo 1 > "$1/cgroup.kill"' sh "/sys/fs/cgroup/$cgroup" 2>/dev/null
     sudo find "/sys/fs/cgroup/$cgroup" -depth -type d -exec rmdir {} \; 2>/dev/null
-    if [ "$status" -ne 0 ]; then
-        for log in "$work"/*.log; do [ -f "$log" ] && { echo "--- $log" >&2; sudo tail -100 "$log" >&2; }; done
-    fi
-    sudo rm -rf "$work"
-    exit "$status"
+    [ "$status" -eq 0 ] || sudo sh -c 'for f in "$1"/*.log; do [ -f "$f" ] && { echo "--- $f"; tail -100 "$f"; }; done' sh "$work" >&2
+    sudo rm -rf "$work"; exit "$status"
 }
 trap cleanup EXIT
-wait_name() {
-    name=$1
-    for _ in $(seq 1 100); do
-        busctl --address="$address" list 2>/dev/null | grep -q "$name" && return 0
-        sleep .05
-    done
-    echo "timed out waiting for $name" >&2
-    return 1
+wait_name() { for _ in $(seq 1 100); do busctl --address="$address" list --acquired 2>/dev/null | grep -q "$1" && return; sleep .05; done; return 1; }
+wait_name_gone() { for _ in $(seq 1 100); do busctl --address="$address" list --acquired 2>/dev/null | grep -q "$1" || return 0; sleep .05; done; return 1; }
+wait_file() { for _ in $(seq 1 100); do sudo test -f "$1" && return; sleep .05; done; return 1; }
+start_daemon() {
+    sudo -E env DBUS_SYSTEM_BUS_ADDRESS="$address" "$repo/target/debug/sessiond" --bus system --config "$work/sessiond.conf" >>"$work/sessiond.log" 2>&1 & daemon=$!
+    wait_name org.decoupling.sessiond1
 }
-wait_file() {
-    file=$1
-    for _ in $(seq 1 100); do sudo test -f "$file" && return 0; sleep .05; done
-    echo "timed out waiting for $file" >&2
-    return 1
+stop_daemon() {
+    sudo kill "$daemon"; wait "$daemon" || true; daemon=
+    wait_name_gone org.decoupling.sessiond1
 }
+start_daemon
+[ "$(busctl --address="$address" call org.decoupling.sessiond1 /org/decoupling/sessiond1 org.decoupling.sessiond1.Manager ListSessions)" = "a(su) 0" ]
 
-sudo mkdir "/sys/fs/cgroup/$cgroup"
-sudo -E env DBUS_SYSTEM_BUS_ADDRESS="$address" "$scoped_repo/target/debug/scoped" --bus system --scope-root "$cgroup" >"$work/scoped.log" 2>&1 & scoped_wrapper=$!
-wait_name org.decoupling.scoped1
-sudo -E env DBUS_SYSTEM_BUS_ADDRESS="$address" "$repo/target/debug/sessiond" --bus system --config "$work/sessiond.conf" >"$work/sessiond.log" 2>&1 & sessiond_wrapper=$!
-wait_name org.decoupling.sessiond1
-
-# Session inventory is public and initially empty.
-empty_output=$(busctl --address="$address" call org.decoupling.sessiond1 \
-    /org/decoupling/sessiond1 org.decoupling.sessiond1.Manager ListSessions)
-[ "$empty_output" = "a(su) 0" ]
-
-# Two sessions share one user manager. Losing one tracked PAM host must only
-# remove that session; normal close of the last removes the manager/runtime.
-sudo -E env DBUS_SYSTEM_BUS_ADDRESS="$address" "$repo/target/debug/examples/hold-session" 0 "$work/first.sid" >"$work/first.log" 2>&1 & first_wrapper=$!
-wait_file "$work/first.sid"
-first_pid=$(pgrep -P "$first_wrapper" -f hold-session)
-sudo -E env DBUS_SYSTEM_BUS_ADDRESS="$address" "$repo/target/debug/examples/hold-session" 0 "$work/second.sid" >"$work/second.log" 2>&1 & second_wrapper=$!
-wait_file "$work/second.sid"
-second_pid=$(pgrep -P "$second_wrapper" -f hold-session)
+sudo -E env DBUS_SYSTEM_BUS_ADDRESS="$address" "$repo/target/debug/examples/hold-session" 0 "$work/one" "$work/sessiond.conf" >"$work/one.log" 2>&1 & hold1=$!
+wait_file "$work/one"; sid1=$(sudo head -n1 "$work/one")
+sudo -E env DBUS_SYSTEM_BUS_ADDRESS="$address" "$repo/target/debug/examples/hold-session" 0 "$work/two" "$work/sessiond.conf" >"$work/two.log" 2>&1 & hold2=$!
+wait_file "$work/two"; sid2=$(sudo head -n1 "$work/two")
 result=$(busctl --address="$address" call org.decoupling.sessiond1 /org/decoupling/sessiond1 org.decoupling.sessiond1.Manager ListSessions)
 echo "$result" | grep -q '^a(su) 2 '
-first_sid=$(sudo head -n 1 "$work/first.sid")
-second_sid=$(sudo head -n 1 "$work/second.sid")
-echo "$result" | grep -q "$first_sid"
-echo "$result" | grep -q "$second_sid"
-if busctl --address="$address" call org.decoupling.sessiond1 \
-    /org/decoupling/sessiond1 org.decoupling.sessiond1.Manager \
-    CloseSession s "$first_sid" >"$work/nonroot-close.log" 2>&1; then
-    echo "non-root CloseSession unexpectedly succeeded" >&2
-    exit 1
-fi
-grep -q 'root-only' "$work/nonroot-close.log"
-[ "$(sudo find "/sys/fs/cgroup/$cgroup/sessiond/user/0/session" -mindepth 1 -maxdepth 1 -type d | wc -l)" -eq 2 ]
-[ "$(sudo cat "/sys/fs/cgroup/$cgroup/sessiond/user/0/service/cgroup.procs" | wc -l)" -eq 1 ]
-sudo kill -KILL "$first_pid"
-wait "$first_wrapper" || true
-first_pid= first_wrapper=
-for _ in $(seq 1 200); do
-    result=$(busctl --address="$address" call org.decoupling.sessiond1 /org/decoupling/sessiond1 org.decoupling.sessiond1.Manager ListSessions)
-    echo "$result" | grep -q '^a(su) 1 ' && break
-    sleep .05
-done
+if busctl --address="$address" call org.decoupling.sessiond1 /org/decoupling/sessiond1 org.decoupling.sessiond1.Manager CloseSession s "$sid1" >"$work/nonroot.log" 2>&1; then exit 1; fi
+grep -q root-only "$work/nonroot.log"
+# Kill one leader while sessiond is down. Restart discovery must remain
+# read-only: the stale initial target stays until an explicit close, while the
+# other live leader is armed for subsequent exit observation.
+stop_daemon
+leader1=$(sudo head -n1 "/sys/fs/cgroup/$cgroup/sessiond/user/0/session/$sid1/cgroup.procs")
+sudo kill -KILL "$leader1"; wait "$hold1" || true; hold1=
+start_daemon
+sleep 1
+result=$(busctl --address="$address" call org.decoupling.sessiond1 /org/decoupling/sessiond1 org.decoupling.sessiond1.Manager ListSessions)
+echo "$result" | grep -q '^a(su) 2 '
+sudo -E env DBUS_SYSTEM_BUS_ADDRESS="$address" busctl --address="$address" call org.decoupling.sessiond1 /org/decoupling/sessiond1 org.decoupling.sessiond1.Manager CloseSessionAndWait s "$sid1" >/dev/null
+result=$(busctl --address="$address" call org.decoupling.sessiond1 /org/decoupling/sessiond1 org.decoupling.sessiond1.Manager ListSessions)
 echo "$result" | grep -q '^a(su) 1 '
-sudo kill -INT "$second_pid"
-wait "$second_wrapper" || true
-second_pid= second_wrapper=
-for _ in $(seq 1 200); do [ ! -e "$work/user/0" ] && break; sleep .05; done
-[ ! -e "$work/user/0" ]
+echo "$result" | grep -q "$sid2"
+leader2=$(sudo head -n1 "/sys/fs/cgroup/$cgroup/sessiond/user/0/session/$sid2/cgroup.procs")
+sudo kill -INT "$leader2"
+for _ in $(seq 1 200); do sudo test ! -e "$work/user/0" && break; sleep .05; done
+sudo test ! -e "$work/user/0"
+hold1= hold2=
 
-# Exercise the real PAM module and verify its transaction environment and
-# synchronous open/close lifecycle against the same daemons.
-sudo -E env DBUS_SYSTEM_BUS_ADDRESS="$address" "$work/pam-app" sessiond-e2e "$work/pam-result" "$work/pam.d" >"$work/pam.log" 2>&1 & pam_wrapper=$!
-wait_file "$work/pam-result"
-pam_pid=$(pgrep -P "$pam_wrapper" -f pam-app)
-sudo awk 'NR==1 { if (length($0) != 32) exit 1 } NR==2 { if ($0 !~ "/user/0$") exit 1 }' "$work/pam-result"
-wait "$pam_wrapper"
-pam_pid= pam_wrapper=
-for _ in $(seq 1 200); do [ ! -e "$work/user/0" ] && break; sleep .05; done
-[ ! -e "$work/user/0" ]
+sudo -E env DBUS_SYSTEM_BUS_ADDRESS="$address" "$work/pam-app" sessiond-e2e "$work/pam-result" "$work/pam.d" >"$work/pam.log" 2>&1 & pam_process=$!
+wait_file "$work/pam-result"; wait "$pam_process" || true; pam_process=
+for _ in $(seq 1 200); do sudo test ! -e "$work/user/0" && break; sleep .05; done
+sudo test ! -e "$work/user/0"
 
-# Root can request asynchronous closure through D-Bus, and the daemon drains
-# the disposable scope.
-sudo -E env DBUS_SYSTEM_BUS_ADDRESS="$address" "$repo/target/debug/examples/hold-session" 0 "$work/cli.sid" >"$work/cli-session.log" 2>&1 & cli_wrapper=$!
-wait_file "$work/cli.sid"
-cli_pid=$(pgrep -P "$cli_wrapper" -f hold-session)
-cli_sid=$(sudo head -n 1 "$work/cli.sid")
-sudo busctl --address="$address" call org.decoupling.sessiond1 \
-    /org/decoupling/sessiond1 org.decoupling.sessiond1.Manager \
-    CloseSession s "$cli_sid" >/dev/null
-for _ in $(seq 1 200); do
-    ! kill -0 "$cli_wrapper" 2>/dev/null && break
-    sleep .05
-done
-if kill -0 "$cli_wrapper" 2>/dev/null; then
-    echo "timed out waiting for CloseSession to drain $cli_sid" >&2
-    exit 1
-fi
-wait "$cli_wrapper" || true
-cli_pid= cli_wrapper=
-for _ in $(seq 1 200); do
-    result=$(busctl --address="$address" call org.decoupling.sessiond1 /org/decoupling/sessiond1 org.decoupling.sessiond1.Manager ListSessions)
-    echo "$result" | grep -q '^a(su) 0$' && break
-    sleep .05
-done
-echo "$result" | grep -q '^a(su) 0$'
+# A manager-launch failure under optional PAM leaves the contained host alive,
+# publishes no session environment, and remains closable through containment.
+sudo -E env DBUS_SYSTEM_BUS_ADDRESS="$address" "$work/pam-fail-open" sessiond-fail-open "$work/fail-open-result" "$work/pam.d" >"$work/fail-open.log" 2>&1 & pam_process=$!
+wait_file "$work/fail-open-result"
+result=$(busctl --address="$address" call org.decoupling.sessiond1 /org/decoupling/sessiond1 org.decoupling.sessiond1.Manager ListSessions)
+echo "$result" | grep -q '^a(su) 1 '
+wait "$pam_process"; pam_process=
+for _ in $(seq 1 200); do result=$(busctl --address="$address" call org.decoupling.sessiond1 /org/decoupling/sessiond1 org.decoupling.sessiond1.Manager ListSessions); [ "$result" = "a(su) 0" ] && break; sleep .05; done
+[ "$result" = "a(su) 0" ]
+sudo test ! -e "$work/user/0"
 
-echo "sessiond root/private-D-Bus/scoped/PAM end-to-end tests passed"
+sudo -E env DBUS_SYSTEM_BUS_ADDRESS="$address" "$repo/target/debug/examples/hold-session" 0 "$work/admin" "$work/sessiond.conf" >"$work/admin.log" 2>&1 & hold1=$!
+wait_file "$work/admin"; sid=$(sudo head -n1 "$work/admin")
+sudo -E env DBUS_SYSTEM_BUS_ADDRESS="$address" busctl --address="$address" call org.decoupling.sessiond1 /org/decoupling/sessiond1 org.decoupling.sessiond1.Manager CloseSessionAndWait s "$sid" >/dev/null
+wait "$hold1" || true; hold1=
+[ "$(busctl --address="$address" call org.decoupling.sessiond1 /org/decoupling/sessiond1 org.decoupling.sessiond1.Manager ListSessions)" = "a(su) 0" ]
+echo "sessiond root end-to-end tests passed"

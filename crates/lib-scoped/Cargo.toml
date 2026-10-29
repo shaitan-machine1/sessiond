@@ -1,0 +1,16 @@
+[package]
+name = "lib-scoped"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Synchronous, caller-owned containment and process-instance observation"
+
+[dependencies]
+libc.workspace = true
+nix.workspace = true
+rustix = { version = "1", features = ["process"] }
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

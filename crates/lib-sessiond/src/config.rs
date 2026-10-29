@@ -51,6 +51,7 @@ impl Default for SessionConfig {
 pub struct ManagerConfig {
     pub shutdown: ShutdownConfig,
     pub launcher: PathBuf,
+    pub pam_service: String,
     #[serde(deserialize_with = "duration")]
     pub ready_timeout: Duration,
 }
@@ -59,12 +60,13 @@ impl Default for ManagerConfig {
     fn default() -> Self {
         let shutdown = ShutdownConfig {
             mode: ShutdownMode::Leader,
-            leader_timeout: Duration::from_secs(30),
+            leader_timeout: Duration::from_secs(10),
             ..ShutdownConfig::default()
         };
         Self {
             shutdown,
             launcher: "/usr/libexec/sessiond/sessiond-user-launcher".into(),
+            pam_service: "sessiond-user".into(),
             ready_timeout: Duration::from_secs(30),
         }
     }
@@ -75,6 +77,7 @@ impl Default for ManagerConfig {
 pub struct Config {
     pub session: SessionConfig,
     pub user_service_manager: ManagerConfig,
+    pub cgroup_root: PathBuf,
     pub runtime_parent: PathBuf,
     pub state_dir: PathBuf,
     pub linger: bool,
@@ -85,6 +88,7 @@ impl Default for Config {
         Self {
             session: SessionConfig::default(),
             user_service_manager: ManagerConfig::default(),
+            cgroup_root: "/sys/fs/cgroup".into(),
             runtime_parent: "/run/user".into(),
             state_dir: "/run/sessiond".into(),
             linger: false,
@@ -123,10 +127,24 @@ impl Config {
             anyhow::ensure!(!value.is_zero(), "{name} must be non-zero");
         }
         anyhow::ensure!(
+            self.cgroup_root.is_absolute(),
+            "cgroup_root must be absolute"
+        );
+        anyhow::ensure!(
             self.runtime_parent.is_absolute(),
             "runtime_parent must be absolute"
         );
         anyhow::ensure!(self.state_dir.is_absolute(), "state_dir must be absolute");
+        anyhow::ensure!(
+            !self.session.shutdown.leader_timeout.is_zero(),
+            "session.shutdown.leader_timeout must be non-zero"
+        );
+        anyhow::ensure!(
+            !self.user_service_manager.pam_service.is_empty()
+                && !self.user_service_manager.pam_service.contains('/')
+                && !self.user_service_manager.pam_service.contains('\0'),
+            "user manager PAM service must be a nonempty service name"
+        );
         anyhow::ensure!(
             self.user_service_manager.launcher.is_absolute(),
             "user manager launcher must be absolute"
@@ -169,6 +187,19 @@ mod tests {
         assert_eq!(
             config.user_service_manager.shutdown.leader_timeout,
             Duration::from_secs(4)
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_private_pam_service() {
+        let mut config = Config::default();
+        config.user_service_manager.pam_service = "path/service".into();
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("PAM service")
         );
     }
 

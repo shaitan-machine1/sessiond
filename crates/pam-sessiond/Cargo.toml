@@ -11,7 +11,6 @@ crate-type = ["cdylib"]
 [dependencies]
 humantime.workspace = true
 libc.workspace = true
+lib-sessiond.workspace = true
 nix.workspace = true
 pam-ffi.workspace = true
-tokio.workspace = true
-zbus.workspace = true

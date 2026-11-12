@@ -54,36 +54,7 @@ pub(crate) fn open(core: &SessionCore, uid: u32) -> Result<OpenSession> {
         std::process::id(),
     )?;
     let runtime = runtime::ensure(&core.config.runtime_parent, uid, user.gid.as_raw())?;
-    let service = well_known::sessiond_user_service(uid);
-    let manager = TargetId::parse("manager").expect("literal target");
-    let mut warnings = Vec::new();
-    if !matches!(
-        domain.target_status(&service, &manager)?,
-        TargetStatus::Running(_)
-    ) {
-        warnings.extend(shutdown::shutdown(
-            &domain,
-            &service,
-            &manager,
-            &core.config.user_service_manager.shutdown,
-        )?);
-        domain.create_scope(&service)?;
-        if let Err(startup_error) = launch(core, &domain, &service, uid, &runtime) {
-            // This is failed-startup helper cleanup, not ordinary session close:
-            // the live optional-PAM login host is deliberately left alone.
-            return match shutdown::shutdown(
-                &domain,
-                &service,
-                &manager,
-                &core.config.user_service_manager.shutdown,
-            ) {
-                Ok(_) => Err(startup_error),
-                Err(cleanup_error) => Err(Error::Startup(format!(
-                    "{startup_error}; startup cleanup incomplete: {cleanup_error}"
-                ))),
-            };
-        }
-    }
+    let mut warnings = ensure_manager(core, &domain, uid, &runtime)?;
     let identity = SessionIdentity {
         id: sid.clone(),
         uid,
@@ -96,6 +67,50 @@ pub(crate) fn open(core: &SessionCore, uid: u32) -> Result<OpenSession> {
         runtime,
         warnings,
     })
+}
+
+fn ensure_manager(
+    core: &SessionCore,
+    domain: &Domain,
+    uid: u32,
+    runtime: &Path,
+) -> Result<Vec<String>> {
+    // This is only manager-startup policy. The session and runtime already
+    // exist, and skipping startup must not inspect or retire an older manager.
+    if uid < core.config.user_service_manager.min_uid {
+        return Ok(Vec::new());
+    }
+    let service = well_known::sessiond_user_service(uid);
+    let manager = TargetId::parse("manager").expect("literal target");
+    let mut warnings = Vec::new();
+    if !matches!(
+        domain.target_status(&service, &manager)?,
+        TargetStatus::Running(_)
+    ) {
+        warnings.extend(shutdown::shutdown(
+            domain,
+            &service,
+            &manager,
+            &core.config.user_service_manager.shutdown,
+        )?);
+        domain.create_scope(&service)?;
+        if let Err(startup_error) = launch(core, domain, &service, uid, runtime) {
+            // This is failed-startup helper cleanup, not ordinary session close:
+            // the live optional-PAM login host is deliberately left alone.
+            return match shutdown::shutdown(
+                domain,
+                &service,
+                &manager,
+                &core.config.user_service_manager.shutdown,
+            ) {
+                Ok(_) => Err(startup_error),
+                Err(cleanup_error) => Err(Error::Startup(format!(
+                    "{startup_error}; startup cleanup incomplete: {cleanup_error}"
+                ))),
+            };
+        }
+    }
+    Ok(warnings)
 }
 
 fn reject_bound_host(domain: &Domain) -> Result<()> {
@@ -323,6 +338,69 @@ fn read_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
+
+    fn manager_fixture(uid: u32) -> (tempfile::TempDir, Domain, SessionCore) {
+        let root = tempfile::tempdir().unwrap();
+        let domain = Domain::create(root.path(), "sessiond").unwrap();
+        domain
+            .create_scope(&ScopeId::parse("sessiond/user").unwrap())
+            .unwrap();
+        domain
+            .create_scope(&well_known::sessiond_user_root(uid))
+            .unwrap();
+        let mut config = Config::default();
+        config.user_service_manager.launcher = root.path().join("missing-launcher");
+        (root, domain, SessionCore::new(config).unwrap())
+    }
+
+    #[test]
+    fn below_min_uid_never_creates_a_service_or_requires_a_launcher() {
+        for uid in [0, 999] {
+            let (root, domain, core) = manager_fixture(uid);
+            let runtime = root.path().join("runtime");
+            assert!(
+                ensure_manager(&core, &domain, uid, &runtime)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                domain
+                    .scope_identity(&well_known::sessiond_user_service(uid))
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(!runtime.exists());
+        }
+    }
+
+    #[test]
+    fn below_min_uid_leaves_an_existing_service_untouched() {
+        let (root, domain, core) = manager_fixture(999);
+        let service = well_known::sessiond_user_service(999);
+        domain.create_scope(&service).unwrap();
+        let identity = domain.scope_identity(&service).unwrap();
+        let marker = root.path().join(service.as_str()).join("untouched");
+        std::fs::write(&marker, "existing service").unwrap();
+        ensure_manager(&core, &domain, 999, &root.path().join("runtime")).unwrap();
+        assert_eq!(domain.scope_identity(&service).unwrap(), identity);
+        assert_eq!(std::fs::read_to_string(marker).unwrap(), "existing service");
+    }
+
+    #[test]
+    fn threshold_is_inclusive_and_zero_enables_root_manager_startup() {
+        for (uid, min_uid) in [(1000, 1000), (1001, 1000), (0, 0)] {
+            let (root, domain, mut core) = manager_fixture(uid);
+            core.config.user_service_manager.min_uid = min_uid;
+            let error =
+                ensure_manager(&core, &domain, uid, &root.path().join("runtime")).unwrap_err();
+            assert!(
+                error.to_string().contains("exec user-manager helper"),
+                "{error}"
+            );
+        }
+    }
+
     #[test]
     fn status_reads_have_one_monotonic_deadline_and_handle_eof() {
         let (mut parent, child) = UnixStream::pair().unwrap();

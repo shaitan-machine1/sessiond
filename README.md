@@ -56,8 +56,15 @@ Listeners must match type/interface/path/member without a sender constraint.
 
 ## Manager startup
 
-A new manager is launched only when no recorded live `manager` PAM host can be
-reused. The launcher pins the service-scope generation, detaches after exec,
+`user_service_manager.min_uid` defaults to **1000**. Below that UID, opening a
+session still creates containment and the runtime directory and publishes the
+normal PAM environment, but skips all manager startup/reuse/replacement work.
+Such sessions do not require a working manager executable or a writable home.
+Set `min_uid = 0` to enable managers for every UID. A threshold change does not
+stop an existing manager; normal last-session cleanup remains unchanged.
+
+For eligible UIDs, a new manager is launched only when no recorded live `manager`
+PAM host can be reused. The launcher pins the service-scope generation, detaches after exec,
 self-migrates, separately assigns target `manager`, opens its private PAM
 session, starts the configured manager as the target user, and reports one-byte
 manager readiness. The original PAM host reaps only the short-lived helper.

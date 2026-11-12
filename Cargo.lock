@@ -267,7 +267,7 @@ checksum = "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb"
 
 [[package]]
 name = "lib-scoped"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "libc",
  "nix",
@@ -278,7 +278,7 @@ dependencies = [
 
 [[package]]
 name = "lib-sessiond"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "dbus",
@@ -370,14 +370,14 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "pam-ffi"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "pam-sessiond"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "humantime",
  "lib-sessiond",
@@ -499,7 +499,7 @@ dependencies = [
 
 [[package]]
 name = "sessiond"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -515,7 +515,7 @@ dependencies = [
 
 [[package]]
 name = "sessiond-user-launcher"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",

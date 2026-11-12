@@ -49,6 +49,9 @@ impl Default for SessionConfig {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ManagerConfig {
+    /// Only UIDs at or above this threshold start or reuse a user manager.
+    /// Session containment and runtime directories are independent of it.
+    pub min_uid: u32,
     pub shutdown: ShutdownConfig,
     pub launcher: PathBuf,
     pub pam_service: String,
@@ -64,6 +67,7 @@ impl Default for ManagerConfig {
             ..ShutdownConfig::default()
         };
         Self {
+            min_uid: 1000,
             shutdown,
             launcher: "/usr/libexec/sessiond/sessiond-user-launcher".into(),
             pam_service: "sessiond-user".into(),
@@ -188,6 +192,39 @@ mod tests {
             config.user_service_manager.shutdown.leader_timeout,
             Duration::from_secs(4)
         );
+    }
+
+    #[test]
+    fn manager_min_uid_defaults_to_1000_in_existing_and_shipped_configs() {
+        for config in [
+            Config::default(),
+            toml::from_str::<Config>("").unwrap(),
+            toml::from_str::<Config>("[user_service_manager]").unwrap(),
+            toml::from_str::<Config>(include_str!("../../../dist/sessiond.conf")).unwrap(),
+        ] {
+            config.validate().unwrap();
+            assert_eq!(config.user_service_manager.min_uid, 1000);
+        }
+    }
+
+    #[test]
+    fn manager_min_uid_accepts_zero_and_custom_thresholds() {
+        for min_uid in [0, 500, 2000, u32::MAX] {
+            let config: Config =
+                toml::from_str(&format!("[user_service_manager]\nmin_uid = {min_uid}")).unwrap();
+            config.validate().unwrap();
+            assert_eq!(config.user_service_manager.min_uid, min_uid);
+        }
+    }
+
+    #[test]
+    fn manager_min_uid_rejects_invalid_values() {
+        for value in ["-1", "4294967296", "1.5", "true", "\"1000\""] {
+            assert!(
+                toml::from_str::<Config>(&format!("[user_service_manager]\nmin_uid = {value}"))
+                    .is_err()
+            );
+        }
     }
 
     #[test]

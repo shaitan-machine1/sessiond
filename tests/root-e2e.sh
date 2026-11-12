@@ -62,6 +62,7 @@ cc "$work/pam-fail-open.c" -lpam -o "$work/pam-fail-open"
 mkdir "$work/pam.d"
 printf 'session required %s timeout=5s config=%s\n' "$repo/target/debug/libpam_sessiond.so" "$work/sessiond.conf" >"$work/pam.d/sessiond-e2e"
 printf 'session required %s fail_open timeout=5s config=%s\n' "$repo/target/debug/libpam_sessiond.so" "$work/fail-open.conf" >"$work/pam.d/sessiond-fail-open"
+printf 'session required %s timeout=5s config=%s\n' "$repo/target/debug/libpam_sessiond.so" "$work/no-manager.conf" >"$work/pam.d/sessiond-no-manager"
 cat >"$work/sessiond.conf" <<EOF
 cgroup_root = "/sys/fs/cgroup/$cgroup"
 runtime_parent = "$work/user"
@@ -74,6 +75,7 @@ mode = "scope"
 leader_timeout = "100ms"
 scope_timeout = "1s"
 [user_service_manager]
+min_uid = 0
 launcher = "$repo/target/debug/sessiond-user-launcher"
 pam_service = "$pam_service"
 ready_timeout = "5s"
@@ -83,6 +85,9 @@ leader_timeout = "1s"
 scope_timeout = "1s"
 EOF
 sed 's#^launcher = .*#launcher = "/definitely/missing/sessiond-launcher"#' "$work/sessiond.conf" >"$work/fail-open.conf"
+# Root is below the default threshold: even a missing launcher must not prevent
+# successful PAM environment publication or ordinary session/runtime cleanup.
+sed '/^min_uid = /d;s#^launcher = .*#launcher = "/definitely/missing/sessiond-launcher"#' "$work/sessiond.conf" >"$work/no-manager.conf"
 sudo chown -R root:root "$work"
 sudo chmod 1777 "$work"
 printf 'session required pam_permit.so\n' | sudo tee "/etc/pam.d/$pam_service" >/dev/null
@@ -117,6 +122,17 @@ stop_daemon() {
 }
 start_daemon
 [ "$(busctl --address="$address" call org.decoupling.sessiond1 /org/decoupling/sessiond1 org.decoupling.sessiond1.Manager ListSessions)" = "a(su) 0" ]
+
+sudo -E env DBUS_SYSTEM_BUS_ADDRESS="$address" "$work/pam-app" sessiond-no-manager "$work/no-manager-result" "$work/pam.d" >"$work/no-manager.log" 2>&1 & pam_process=$!
+wait_file "$work/no-manager-result"
+sudo test -d "$work/user/0"
+[ "$(sudo stat -c '%u:%a' "$work/user/0")" = '0:700' ]
+sudo test ! -e "/sys/fs/cgroup/$cgroup/sessiond/user/0/service"
+result=$(busctl --address="$address" call org.decoupling.sessiond1 /org/decoupling/sessiond1 org.decoupling.sessiond1.Manager ListSessions)
+echo "$result" | grep -q '^a(su) 1 '
+wait "$pam_process" || true; pam_process=
+for _ in $(seq 1 200); do sudo test ! -e "$work/user/0" && break; sleep .05; done
+sudo test ! -e "$work/user/0"
 
 sudo -E env DBUS_SYSTEM_BUS_ADDRESS="$address" "$repo/target/debug/examples/hold-session" 0 "$work/one" "$work/sessiond.conf" >"$work/one.log" 2>&1 & hold1=$!
 wait_file "$work/one"; sid1=$(sudo head -n1 "$work/one")

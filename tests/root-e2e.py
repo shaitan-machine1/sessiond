@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Private mount namespace; caller-supplied disposable cgroup parent ONLY.
+"""Private mount namespace and a harness-owned constant disposable cgroup root.
 
-No installed PAM writes, guessed cgroup root, service activation or hardware.
+No installed PAM writes, live hierarchy discovery, service activation or hardware.
 The invoking shell builds all executables as the ordinary user first.
 """
 import ctypes
@@ -18,6 +18,8 @@ import tempfile
 import time
 import uuid
 
+from cgroup_fixture import test_root
+
 
 class Skip(Exception):
     pass
@@ -31,13 +33,12 @@ def wait_for(predicate, label, seconds=12):
         time.sleep(0.02)
 
 
-def main():
+def main(parent):
     assert os.geteuid() == 0
-    repo, built, parent, uid = Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3]), int(sys.argv[4])
-    assert parent.is_absolute() and parent.resolve(strict=True) == parent
-    assert parent != Path("/sys/fs/cgroup") and parent != Path("/")
-    assert subprocess.check_output(["stat", "-f", "-c", "%T", parent], text=True).strip() == "cgroup2fs"
-    assert (parent / "cgroup.procs").is_file()
+    repo, built, uid = Path(sys.argv[1]), Path(sys.argv[2]), int(sys.argv[3])
+    assert os.readlink("/proc/self/ns/mnt") != os.readlink(f"/proc/{os.getppid()}/ns/mnt"), (
+        "run tests/root-e2e.sh: a private mount namespace is mandatory"
+    )
     assert ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0) == 0  # child subreaper: verify orphan reaping
     signal.signal(signal.SIGCHLD, signal.SIG_DFL)
     user = pwd.getpwuid(uid).pw_name
@@ -261,7 +262,8 @@ scope_timeout = "200ms"
 
 if __name__ == "__main__":
     try:
-        main()
+        with test_root() as parent:
+            main(parent)
     except Skip as error:
         print(f"SKIP: {error}", file=sys.stderr)
         sys.exit(77)

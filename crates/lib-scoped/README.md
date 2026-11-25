@@ -93,14 +93,18 @@ cargo tree -p lib-scoped -e normal
 
 Plain-directory tests cover structure, safe path handling, metadata, failure
 paths and observation; they do not emulate cgroup kernel behavior. Real-kernel
-tests are explicitly opt-in and create only unique domains under an
-administrator-provided disposable/delegated parent:
+tests are explicitly opt-in. From the repository root, run:
 
 ```sh
-LIB_SCOPED_TEST_ROOT=/sys/fs/cgroup/DISPOSABLE_PARENT \
-  cargo test -p lib-scoped --test cgroup -- --ignored
+./tests/cgroup.sh
 ```
 
-Those tests require migration, freezer, kill and xattr permissions. They never
-scan or clean production domains. The former standalone daemon/API repository
+The wrapper builds unprivileged and executes the probe using noninteractive sudo.
+Its fixture exclusively creates `/sys/fs/cgroup/sglogin-tests` (mode 0700), runs
+root-fixture safety checks and creates unique domains for the six kernel tests.
+It drains/removes only its own fresh root; an existing root is refused, never
+adopted or swept. No `LIB_SCOPED_TEST_ROOT` configuration is needed. Normal Cargo
+runs keep these tests ignored. The root wrapper requires a writable cgroup-v2
+mount with migration, freezer, kill and xattr permissions. It never scans or
+cleans production domains. The former standalone daemon/API repository
 is retired; maintained consumers use this crate directly.

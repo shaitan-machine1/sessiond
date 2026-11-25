@@ -156,15 +156,22 @@ PAM tests use private configuration only; no installed PAM/service changes.
 Build as an ordinary user. Root phases use already-built artifacts and
 noninteractive `sudo`; missing prerequisites return **77 (skip)**, not success.
 
-Real-cgroup tests require an **explicitly supplied disposable delegated parent**:
+Real-cgroup tests own the fixed disposable root
+`/sys/fs/cgroup/sglogin-tests`; no environment variable or manual delegation setup
+is required. From the repository root, run:
 
 ```sh
-LIB_SCOPED_TEST_ROOT=/sys/fs/cgroup/DISPOSABLE_PARENT \
-  cargo test -p lib-scoped --test cgroup -- --ignored
-LIB_SCOPED_TEST_ROOT=/sys/fs/cgroup/DISPOSABLE_PARENT ./tests/root-e2e.sh
+./tests/cgroup.sh     # root-fixture safety checks and six lib-scoped kernel tests
+./tests/root-e2e.sh   # includes cgroup.sh, then real daemon/PAM lifecycle tests
 ```
 
-The root harness uses only a fresh child of that parent and a private mount
-namespace for private PAM, verifies local open/readiness/PAM/restart/manager reuse,
-FD/credential boundaries and subtree drain. It never guesses a live hierarchy.
+The harness builds as the normal user, exclusively creates that root as root
+with mode 0700, and removes only its fresh fixture hierarchy. An existing test
+root is an error: it is never adopted, killed or swept. A writable cgroup-v2
+mount and noninteractive sudo are required. Normal Cargo runs keep the six
+privileged kernel tests ignored; use these wrappers to actually execute them.
+
+The end-to-end phase additionally uses a private mount namespace for private PAM
+and verifies local open/readiness/PAM/restart/manager reuse, FD/credential
+boundaries and subtree drain. It never discovers or touches production domains.
 No build or synthetic/headless test establishes deployment or desktop acceptance.

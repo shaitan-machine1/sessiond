@@ -1,11 +1,15 @@
-//! Real-kernel tests. Opt in only with an explicitly delegated, disposable
-//! cgroup-v2 parent: LIB_SCOPED_TEST_ROOT=/sys/fs/cgroup/... cargo test -p
-//! lib-scoped --test cgroup -- --ignored. No production-domain discovery.
+//! Real-kernel tests. Run tests/cgroup.sh: build unprivileged, then execute
+//! this probe as root under the harness-owned constant cgroup root. No live
+//! hierarchy discovery or caller-supplied test-root environment is used.
 use lib_scoped::{Domain, Error, EventKind, Observer, ScopeId, TargetId, TargetStatus};
 use std::fs;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+// Reserved and exclusively created/cleaned by tests/cgroup_fixture.py.
+const TEST_ROOT: &str = "/sys/fs/cgroup/sglogin-tests";
 
 struct Fixture {
     domain: Domain,
@@ -14,13 +18,15 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
-        let parent = PathBuf::from(std::env::var_os("LIB_SCOPED_TEST_ROOT").expect(
-            "set LIB_SCOPED_TEST_ROOT to an explicitly delegated disposable cgroup-v2 directory",
-        ));
-        assert!(
-            parent.join("cgroup.controllers").is_file(),
-            "test root must be cgroup v2"
-        );
+        // SAFETY: geteuid has no pointer arguments or memory-safety preconditions.
+        assert_eq!(unsafe { libc::geteuid() }, 0, "run tests/cgroup.sh");
+        let parent = PathBuf::from(TEST_ROOT);
+        let metadata = fs::symlink_metadata(&parent).expect("run tests/cgroup.sh");
+        assert!(metadata.is_dir());
+        assert_eq!(metadata.uid(), 0);
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+        assert_eq!(parent.canonicalize().unwrap(), parent);
+        assert!(parent.join("cgroup.controllers").is_file());
         let name = format!(
             "lib-scoped-test-{}-{}",
             std::process::id(),
@@ -105,7 +111,7 @@ fn target() -> TargetId {
 }
 
 #[test]
-#[ignore = "requires LIB_SCOPED_TEST_ROOT delegated cgroup-v2 directory"]
+#[ignore = "run tests/cgroup.sh for the harness-owned real-cgroup root"]
 fn tracking_termination_and_nonrecursive_removal() {
     let mut fixture = Fixture::new();
     let session = fixture.create("session");
@@ -146,7 +152,7 @@ fn tracking_termination_and_nonrecursive_removal() {
 }
 
 #[test]
-#[ignore = "requires LIB_SCOPED_TEST_ROOT delegated cgroup-v2 directory"]
+#[ignore = "run tests/cgroup.sh for the harness-owned real-cgroup root"]
 fn migration_does_not_mean_exit_and_signalling_checks_membership() {
     let mut fixture = Fixture::new();
     let a = fixture.create("a");
@@ -170,7 +176,7 @@ fn migration_does_not_mean_exit_and_signalling_checks_membership() {
 }
 
 #[test]
-#[ignore = "requires LIB_SCOPED_TEST_ROOT delegated cgroup-v2 directory"]
+#[ignore = "run tests/cgroup.sh for the harness-owned real-cgroup root"]
 fn assignment_is_exclusive_without_a_userspace_lock() {
     let mut fixture = Fixture::new();
     let scope = fixture.create("a");
@@ -203,7 +209,7 @@ fn assignment_is_exclusive_without_a_userspace_lock() {
 }
 
 #[test]
-#[ignore = "requires LIB_SCOPED_TEST_ROOT delegated cgroup-v2 directory"]
+#[ignore = "run tests/cgroup.sh for the harness-owned real-cgroup root"]
 fn target_record_replacement_does_not_rebind_an_existing_watch() {
     let mut fixture = Fixture::new();
     let scope = fixture.create("a");
@@ -239,7 +245,7 @@ fn target_record_replacement_does_not_rebind_an_existing_watch() {
 }
 
 #[test]
-#[ignore = "requires LIB_SCOPED_TEST_ROOT delegated cgroup-v2 directory"]
+#[ignore = "run tests/cgroup.sh for the harness-owned real-cgroup root"]
 fn already_frozen_subtrees_recover_by_retrying_termination() {
     let mut fixture = Fixture::new();
     let scope = fixture.create("a");
@@ -258,7 +264,7 @@ fn already_frozen_subtrees_recover_by_retrying_termination() {
 }
 
 #[test]
-#[ignore = "requires LIB_SCOPED_TEST_ROOT delegated cgroup-v2 directory"]
+#[ignore = "run tests/cgroup.sh for the harness-owned real-cgroup root"]
 fn kill_and_removal_do_not_depend_on_valid_target_metadata() {
     let mut fixture = Fixture::new();
     let scope = fixture.create("a");

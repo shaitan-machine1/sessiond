@@ -1,4 +1,5 @@
 # Dedicated non-recursive user-manager stack.
+# Never invoke pam_sessiond_core.so, pam_sessiond_ready.so or sessiond-session here.
 session required pam_limits.so
 session required pam_env.so
 session required pam_permit.so

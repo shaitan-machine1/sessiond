@@ -1,0 +1,3 @@
+# One PAM transaction: required local containment, optional daemon readiness.
+session required pam_sessiond_core.so
+session optional pam_sessiond_ready.so timeout=30s

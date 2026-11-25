@@ -1,324 +1,442 @@
-use lib_sessiond::{SessionCore, validate_session_id};
+//! Fixed execution capacity and a bounded waiting queue. UID lanes are selected
+//! before dispatch: workers never queue behind a slow UID's lifecycle lock.
+use crate::{
+    SessionCore,
+    core::{CloseCompletion, failure},
+};
+use lib_scoped::{ScopeHandle, ScopeIdentity, TargetStatus};
+use lib_sessiond::{Error, ErrorCode, Result};
+use std::any::Any;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{Arc, Condvar, Mutex, mpsc};
-
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 const WORKERS: usize = 4;
 const QUEUE_CAPACITY: usize = 128;
-const MAX_WAITERS: usize = 128;
-type Completion = std::result::Result<(), String>;
-struct State {
-    complete: Option<Completion>,
+const MAX_CLOSES: usize = 4096;
+pub type Permit = Arc<OwnedSemaphorePermit>;
+type Value = Box<dyn Any + Send>;
+type Effect = Box<dyn FnOnce(&SessionCore) -> Result<Value> + Send>;
+struct Request {
+    uid: Option<u32>,
+    effect: Effect,
+    reply: oneshot::Sender<Result<Value>>,
+    _permit: Permit,
 }
-pub struct Operation {
-    state: Mutex<State>,
-    changed: Condvar,
-}
-impl Operation {
-    fn pending() -> Self {
-        Self {
-            state: Mutex::new(State { complete: None }),
-            changed: Condvar::new(),
-        }
-    }
-    fn finish(&self, result: Completion) {
-        let mut state = self.state.lock().expect("operation mutex poisoned");
-        state.complete = Some(result);
-        self.changed.notify_all();
-    }
-    pub fn wait(&self) -> Completion {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| "operation mutex poisoned".to_owned())?;
-        while state.complete.is_none() {
-            state = self
-                .changed
-                .wait(state)
-                .map_err(|_| "operation mutex poisoned".to_owned())?;
-        }
-        state.complete.clone().expect("completion checked")
-    }
-}
-struct Work {
-    sid: String,
+struct Close {
     uid: u32,
-    operation: Arc<Operation>,
+    generation: ScopeIdentity,
+    _scope: ScopeHandle,
+    deadline: Instant,
+    started: bool,
+    completion: Arc<CloseCompletion>,
 }
 #[derive(Default)]
-struct Coordination {
-    pending: HashMap<String, Arc<Operation>>,
+struct State {
+    requests: VecDeque<Request>,
     active_uids: HashSet<u32>,
-    waiting: HashMap<u32, VecDeque<Work>>,
-    queued: usize,
+    closes: HashMap<String, Close>,
+    reconcile: HashSet<u32>,
+    stopping: bool,
+    turn: usize,
 }
 struct Inner {
     core: Arc<SessionCore>,
-    coordination: Mutex<Coordination>,
-    sender: mpsc::SyncSender<Work>,
-    waiters: Mutex<usize>,
+    state: Mutex<State>,
+    changed: Condvar,
+    admission: Arc<Semaphore>,
 }
 #[derive(Clone)]
 pub struct Scheduler {
     inner: Arc<Inner>,
+    workers: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
+}
+enum Work {
+    Request(Request),
+    Close {
+        sid: String,
+        uid: u32,
+        generation: ScopeIdentity,
+    },
+    Reconcile(u32),
+}
+impl Work {
+    fn uid(&self) -> Option<u32> {
+        match self {
+            Self::Request(row) => row.uid,
+            Self::Close { uid, .. } | Self::Reconcile(uid) => Some(*uid),
+        }
+    }
 }
 impl Scheduler {
     pub fn new(core: Arc<SessionCore>) -> Self {
-        let (sender, receiver) = mpsc::sync_channel(QUEUE_CAPACITY);
         let inner = Arc::new(Inner {
             core,
-            coordination: Mutex::new(Coordination::default()),
-            sender,
-            waiters: Mutex::new(0),
+            state: Mutex::new(State::default()),
+            changed: Condvar::new(),
+            admission: Arc::new(Semaphore::new(QUEUE_CAPACITY + WORKERS)),
         });
-        let receiver = Arc::new(Mutex::new(receiver));
+        let mut workers = Vec::new();
         for index in 0..WORKERS {
             let inner = inner.clone();
-            let receiver = receiver.clone();
-            std::thread::Builder::new()
-                .name(format!("sessiond-cleanup-{index}"))
-                .spawn(move || worker(inner, receiver))
-                .expect("spawn cleanup worker");
+            workers.push(
+                std::thread::Builder::new()
+                    .name(format!("sessiond-effects-{index}"))
+                    .spawn(move || worker(inner))
+                    .expect("spawn fixed effect worker"),
+            );
         }
-        Self { inner }
-    }
-    /// Duplicate requests join pending work even after its session scope has
-    /// disappeared. Only one work item per UID reaches the worker pool; queued
-    /// requests for one slow UID cannot occupy every cleanup worker.
-    pub fn schedule(&self, sid: &str) -> std::result::Result<Option<Arc<Operation>>, String> {
-        validate_session_id(sid).map_err(|e| e.to_string())?;
-        {
-            let coordination = self
-                .inner
-                .coordination
-                .lock()
-                .map_err(|_| "cleanup coordination mutex poisoned".to_owned())?;
-            if let Some(operation) = coordination.pending.get(sid) {
-                return Ok(Some(operation.clone()));
-            }
+        Self {
+            inner,
+            workers: Arc::new(Mutex::new(workers)),
         }
-        let Some(session) = self
-            .inner
-            .core
-            .find_session(sid)
-            .map_err(|e| e.to_string())?
-        else {
-            return Ok(None);
-        };
-        let mut coordination = self
-            .inner
-            .coordination
-            .lock()
-            .map_err(|_| "cleanup coordination mutex poisoned".to_owned())?;
-        if let Some(operation) = coordination.pending.get(sid) {
-            return Ok(Some(operation.clone()));
-        }
-        if coordination.active_uids.contains(&session.uid) && coordination.queued >= QUEUE_CAPACITY
-        {
-            return Err("cleanup queue is full".into());
-        }
-        let operation = Arc::new(Operation::pending());
-        let work = Work {
-            sid: sid.to_owned(),
-            uid: session.uid,
-            operation: operation.clone(),
-        };
-        coordination
-            .pending
-            .insert(sid.to_owned(), operation.clone());
-        if coordination.active_uids.insert(session.uid) {
-            match self.inner.sender.try_send(work) {
-                Ok(()) => Ok(Some(operation)),
-                Err(error) => {
-                    coordination.active_uids.remove(&session.uid);
-                    coordination.pending.remove(sid);
-                    Err(match error {
-                        mpsc::TrySendError::Full(_) => "cleanup queue is full".into(),
-                        mpsc::TrySendError::Disconnected(_) => {
-                            "cleanup workers are unavailable".into()
-                        }
-                    })
-                }
-            }
-        } else {
-            coordination
-                .waiting
-                .entry(session.uid)
-                .or_default()
-                .push_back(work);
-            coordination.queued += 1;
-            Ok(Some(operation))
-        }
-    }
-    pub fn acquire_waiter(&self) -> std::result::Result<WaiterPermit, String> {
-        let mut waiters = self
-            .inner
-            .waiters
-            .lock()
-            .map_err(|_| "waiter mutex poisoned".to_owned())?;
-        if *waiters >= MAX_WAITERS {
-            return Err("too many blocking close callers".into());
-        }
-        *waiters += 1;
-        Ok(WaiterPermit {
-            inner: self.inner.clone(),
-        })
     }
     pub fn core(&self) -> &Arc<SessionCore> {
         &self.inner.core
     }
-}
-pub struct WaiterPermit {
-    inner: Arc<Inner>,
-}
-impl Drop for WaiterPermit {
-    fn drop(&mut self) {
-        if let Ok(mut waiters) = self.inner.waiters.lock() {
-            *waiters = waiters.saturating_sub(1);
+    /// Reserve before authentication or other await points. Rejected RPCs never
+    /// create detached effects, unlimited authorization waiters or timers.
+    pub fn admit(&self) -> Result<Permit> {
+        if self
+            .inner
+            .state
+            .lock()
+            .expect("scheduler poisoned")
+            .stopping
+        {
+            return Err(Error::new(ErrorCode::Stopping, "sessiond is stopping"));
         }
+        self.inner
+            .admission
+            .clone()
+            .try_acquire_owned()
+            .map(Arc::new)
+            .map_err(|_| Error::new(ErrorCode::Busy, "sessiond request capacity exhausted"))
     }
-}
-fn worker(inner: Arc<Inner>, receiver: Arc<Mutex<mpsc::Receiver<Work>>>) {
-    loop {
-        let work = match receiver.lock() {
-            Ok(receiver) => receiver.recv(),
-            Err(_) => return,
-        };
-        let Ok(mut work) = work else {
-            return;
-        };
-        loop {
-            let result =
-                lib_sessiond::daemon_support::execute_close_session(&inner.core, &work.sid)
-                    .map(|report| {
-                        for warning in report.warnings {
-                            tracing::warn!(sid = %work.sid, %warning, "session cleanup warning");
-                        }
-                    })
-                    .map_err(|e| e.to_string());
-            if let Err(error) = &result {
-                tracing::error!(sid = %work.sid, %error, "session cleanup failed");
+    pub async fn execute<R: Send + 'static>(
+        &self,
+        permit: Permit,
+        uid: Option<u32>,
+        effect: impl FnOnce(&SessionCore) -> crate::Result<R> + Send + 'static,
+    ) -> Result<R> {
+        let (reply, receiver) = oneshot::channel();
+        {
+            let mut state = self.inner.state.lock().expect("scheduler poisoned");
+            if state.stopping {
+                return Err(Error::new(ErrorCode::Stopping, "sessiond is stopping"));
             }
-            work.operation.finish(result);
-            let Some(next) = finish_and_take_next(&inner, &work) else {
-                break;
-            };
-            work = next;
+            if state.requests.len() >= QUEUE_CAPACITY {
+                return Err(Error::new(
+                    ErrorCode::Busy,
+                    "sessiond waiting queue is full",
+                ));
+            }
+            state.requests.push_back(Request {
+                uid,
+                effect: Box::new(move |core| {
+                    effect(core)
+                        .map(|value| Box::new(value) as Value)
+                        .map_err(|e| e.public())
+                }),
+                reply,
+                _permit: permit,
+            });
+        }
+        self.inner.changed.notify_all();
+        let value = receiver
+            .await
+            .map_err(|_| Error::new(ErrorCode::Stopping, "sessiond execution stopped"))??;
+        value
+            .downcast::<R>()
+            .map(|value| *value)
+            .map_err(|_| Error::new(ErrorCode::BackendError, "internal reply type mismatch"))
+    }
+    /// Called by normal lifecycle triggers. A dirty UID is coalesced and retained
+    /// even when the public queue is full; failures do not reinsert themselves.
+    pub fn reconcile(&self, uid: u32) {
+        self.inner
+            .state
+            .lock()
+            .expect("scheduler poisoned")
+            .reconcile
+            .insert(uid);
+        self.inner.changed.notify_all();
+    }
+    pub fn schedule(
+        &self,
+        sid: &str,
+        immediate: bool,
+    ) -> crate::Result<Option<Arc<CloseCompletion>>> {
+        self.schedule_at(sid, immediate, Instant::now())
+    }
+    fn schedule_at(
+        &self,
+        sid: &str,
+        immediate: bool,
+        now: Instant,
+    ) -> crate::Result<Option<Arc<CloseCompletion>>> {
+        crate::inventory::validate_session_id(sid)?;
+        let Some(session) = self.core().find_session(sid)? else {
+            return Ok(None);
+        };
+        let (domain, _, scope) = self.core().session_scope(sid)?;
+        {
+            let mut state = self.inner.state.lock().expect("scheduler poisoned");
+            if state.closes.get(sid).is_some_and(|close| {
+                close.completion.result.borrow().is_some() || close.generation != scope.identity()
+            }) {
+                if let Some(old) = state.closes.remove(sid)
+                    && old.generation != scope.identity()
+                {
+                    // Its original instance is gone, not a successful removal
+                    // of the replacement requested by this new call.
+                    old.completion.result.send_replace(Some(Ok(())));
+                }
+                self.core()
+                    .completions
+                    .lock()
+                    .expect("close registry poisoned")
+                    .remove(sid);
+            }
+            if let Some(close) = state.closes.get_mut(sid) {
+                if immediate {
+                    close.deadline = now;
+                    self.inner.changed.notify_all();
+                }
+                return Ok(Some(close.completion.clone()));
+            }
+        }
+        let mut grace = if immediate {
+            Duration::ZERO
+        } else {
+            self.core().config().session.close_grace
+        };
+        if !immediate {
+            match domain.target_status(scope.id(), &crate::core::master()) {
+                Ok(TargetStatus::Running(_)) => self.core().observation.arm(&domain, &session)?,
+                Ok(TargetStatus::Exited(_)) => grace = Duration::ZERO,
+                Ok(TargetStatus::Untracked) => {}
+                Err(error) => {
+                    tracing::warn!(%error, sid, "cannot observe scheduled master; explicit deadline still applies")
+                }
+            }
+        }
+        let deadline = now
+            .checked_add(grace)
+            .ok_or_else(|| failure(ErrorCode::InvalidArgument, "close deadline overflow"))?;
+        let mut state = self.inner.state.lock().expect("scheduler poisoned");
+        if let Some(close) = state.closes.get_mut(sid) {
+            if close.generation != scope.identity() {
+                return Err(failure(
+                    ErrorCode::SessionNotFound,
+                    "session generation changed while scheduling",
+                ));
+            }
+            close.deadline = close.deadline.min(deadline);
+            return Ok(Some(close.completion.clone()));
+        }
+        if state.stopping {
+            return Err(failure(ErrorCode::Stopping, "sessiond is stopping"));
+        }
+        if state.closes.len() >= MAX_CLOSES {
+            return Err(failure(
+                ErrorCode::LimitExceeded,
+                "scheduled-close capacity exhausted",
+            ));
+        }
+        let (result, _) = tokio::sync::watch::channel(None);
+        let completion = Arc::new(CloseCompletion {
+            generation: scope.identity(),
+            result,
+        });
+        self.core()
+            .completions
+            .lock()
+            .expect("close registry poisoned")
+            .insert(sid.to_owned(), completion.clone());
+        state.closes.insert(
+            sid.to_owned(),
+            Close {
+                uid: session.uid,
+                generation: scope.identity(),
+                _scope: scope,
+                deadline,
+                started: false,
+                completion: completion.clone(),
+            },
+        );
+        self.inner.changed.notify_all();
+        Ok(Some(completion))
+    }
+    pub async fn wait(completion: Arc<CloseCompletion>) -> Result<()> {
+        let mut receiver = completion.result.subscribe();
+        loop {
+            if let Some(result) = receiver.borrow_and_update().clone() {
+                return result;
+            }
+            receiver
+                .changed()
+                .await
+                .map_err(|_| Error::new(ErrorCode::Stopping, "close completion lost"))?;
+        }
+    }
+    /// Stop both wire admission and effect enqueueing before disconnect/quiescence.
+    pub fn stop_admission(&self) {
+        self.inner.admission.close();
+        self.inner
+            .state
+            .lock()
+            .expect("scheduler poisoned")
+            .stopping = true;
+        self.inner.changed.notify_all();
+    }
+    /// Drain accepted work and join ALL workers while the lifetime lock is held.
+    pub fn shutdown(&self) {
+        self.stop_admission();
+        for worker in self
+            .workers
+            .lock()
+            .expect("worker registry poisoned")
+            .drain(..)
+        {
+            worker.join().expect("effect worker panicked");
         }
     }
 }
-fn finish_and_take_next(inner: &Inner, completed: &Work) -> Option<Work> {
-    let Ok(mut coordination) = inner.coordination.lock() else {
-        return None;
-    };
-    if coordination
-        .pending
-        .get(&completed.sid)
-        .is_some_and(|current| Arc::ptr_eq(current, &completed.operation))
-    {
-        coordination.pending.remove(&completed.sid);
-    }
-    let next = coordination
-        .waiting
-        .get_mut(&completed.uid)
-        .and_then(VecDeque::pop_front);
-    if next.is_some() {
-        coordination.queued -= 1;
-    }
-    if coordination
-        .waiting
-        .get(&completed.uid)
-        .is_some_and(VecDeque::is_empty)
-    {
-        coordination.waiting.remove(&completed.uid);
-    }
-    if next.is_none() {
-        coordination.active_uids.remove(&completed.uid);
-    }
-    next
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use lib_sessiond::config::Config;
-    fn test_inner(core: Arc<SessionCore>) -> Inner {
-        let (sender, _receiver) = mpsc::sync_channel(1);
-        Inner {
-            core,
-            coordination: Mutex::new(Coordination::default()),
-            sender,
-            waiters: Mutex::new(0),
+#[path = "scheduler_tests.rs"]
+mod tests;
+fn take(inner: &Inner, state: &mut State, now: Instant) -> Option<Work> {
+    // Completion may come from reconciliation before service/runtime cleanup.
+    // Remove only the scheduling record, never make waiters wait for that cleanup.
+    let completed: Vec<_> = state
+        .closes
+        .iter()
+        .filter(|(_, close)| close.completion.result.borrow().is_some())
+        .map(|(sid, _)| sid.clone())
+        .collect();
+    for sid in completed {
+        state.closes.remove(&sid);
+        inner
+            .core
+            .completions
+            .lock()
+            .expect("close registry poisoned")
+            .remove(&sid);
+    }
+    for offset in 0..3 {
+        let kind = (state.turn + offset) % 3;
+        let selected = match kind {
+            0 => state
+                .requests
+                .iter()
+                .position(|request| {
+                    request
+                        .uid
+                        .is_none_or(|uid| !state.active_uids.contains(&uid))
+                })
+                .and_then(|index| state.requests.remove(index))
+                .map(Work::Request),
+            1 => {
+                let sid = state
+                    .closes
+                    .iter()
+                    .find(|(_, close)| {
+                        !close.started
+                            && !state.active_uids.contains(&close.uid)
+                            && close.deadline <= now
+                    })
+                    .map(|(sid, _)| sid.clone());
+                sid.map(|sid| {
+                    let close = state.closes.get_mut(&sid).expect("selected close");
+                    close.started = true;
+                    Work::Close {
+                        sid,
+                        uid: close.uid,
+                        generation: close.generation,
+                    }
+                })
+            }
+            _ => {
+                let uid = state
+                    .reconcile
+                    .iter()
+                    .find(|uid| !state.active_uids.contains(uid))
+                    .copied();
+                uid.map(|uid| {
+                    state.reconcile.remove(&uid);
+                    Work::Reconcile(uid)
+                })
+            }
+        };
+        if let Some(work) = selected {
+            state.turn = (kind + 1) % 3;
+            if let Some(uid) = work.uid() {
+                state.active_uids.insert(uid);
+            }
+            return Some(work);
         }
     }
-
-    #[test]
-    fn same_uid_followup_stays_with_the_active_worker() {
-        let root = tempfile::tempdir().unwrap();
-        let core = Arc::new(
-            SessionCore::new(Config {
-                cgroup_root: root.path().to_owned(),
-                ..Config::default()
-            })
-            .unwrap(),
-        );
-        let inner = test_inner(core);
-        let first = Work {
-            sid: "0123456789abcdef0123456789abcdef".into(),
-            uid: 1000,
-            operation: Arc::new(Operation::pending()),
+    None
+}
+fn worker(inner: Arc<Inner>) {
+    loop {
+        let work = {
+            let mut state = inner.state.lock().expect("scheduler poisoned");
+            loop {
+                if let Some(work) = take(&inner, &mut state, Instant::now()) {
+                    break work;
+                }
+                if state.stopping
+                    && state.requests.is_empty()
+                    && state.active_uids.is_empty()
+                    && state.closes.is_empty()
+                    && state.reconcile.is_empty()
+                {
+                    return;
+                }
+                state = inner
+                    .changed
+                    .wait_timeout(state, Duration::from_millis(25))
+                    .expect("scheduler poisoned")
+                    .0;
+            }
         };
-        let second = Work {
-            sid: "1123456789abcdef0123456789abcdef".into(),
-            uid: 1000,
-            operation: Arc::new(Operation::pending()),
-        };
-        {
-            let mut state = inner.coordination.lock().unwrap();
-            state.active_uids.insert(1000);
-            state
-                .pending
-                .insert(first.sid.clone(), first.operation.clone());
-            state
-                .pending
-                .insert(second.sid.clone(), second.operation.clone());
-            state.waiting.entry(1000).or_default().push_back(second);
-            state.queued = 1;
+        let uid = work.uid();
+        match work {
+            Work::Request(request) => {
+                let result = (request.effect)(&inner.core);
+                let _ = request.reply.send(result); /* permit remains held until actual completion */
+            }
+            Work::Close {
+                sid,
+                uid,
+                generation,
+            } => match inner.core.close_tree(&sid, Some(generation)) {
+                Ok(()) => {
+                    inner
+                        .state
+                        .lock()
+                        .expect("scheduler poisoned")
+                        .reconcile
+                        .insert(uid);
+                }
+                Err(error) => tracing::error!(%error, sid, "session-tree teardown failed"),
+            },
+            Work::Reconcile(uid) => {
+                if let Err(error) = inner.core.reconcile(uid) {
+                    tracing::warn!(%error, uid, "UID reconciliation failed; awaiting a normal trigger");
+                }
+            }
         }
-        let second = finish_and_take_next(&inner, &first).expect("same-UID followup");
-        {
-            let state = inner.coordination.lock().unwrap();
-            assert!(state.active_uids.contains(&1000));
-            assert_eq!(state.queued, 0);
-            assert!(!state.pending.contains_key(&first.sid));
-        }
-        assert!(finish_and_take_next(&inner, &second).is_none());
-        assert!(
-            !inner
-                .coordination
+        if let Some(uid) = uid {
+            inner
+                .state
                 .lock()
-                .unwrap()
+                .expect("scheduler poisoned")
                 .active_uids
-                .contains(&1000)
-        );
-    }
-
-    #[test]
-    fn unknown_close_is_immediate_and_invalid_ids_are_rejected() {
-        let root = tempfile::tempdir().unwrap();
-        let core = Arc::new(
-            SessionCore::new(Config {
-                cgroup_root: root.path().to_owned(),
-                ..Config::default()
-            })
-            .unwrap(),
-        );
-        let scheduler = Scheduler::new(core);
-        assert!(
-            scheduler
-                .schedule("0123456789abcdef0123456789abcdef")
-                .unwrap()
-                .is_none()
-        );
-        assert!(scheduler.schedule("bad").is_err());
+                .remove(&uid);
+        }
+        inner.changed.notify_all();
     }
 }

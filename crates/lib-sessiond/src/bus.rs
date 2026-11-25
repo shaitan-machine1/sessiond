@@ -1,152 +1,372 @@
-//! Synchronous D-Bus clients and lifecycle signal publication.
-//! No connection starts a background executor or transport thread.
-use crate::{Error, LifecycleEvents, Result, SessionIdentity};
-use dbus::blocking::{Connection, Proxy};
-use dbus::channel::Sender;
-use dbus::message::Message;
-use dbus::strings::{Interface, Member, Path};
-use std::sync::Mutex;
+//! Caller-driven libdbus transport: no executor, background thread or lifecycle lock.
+use crate::{Attributes, Error, ErrorCode, Result, SessionInfo, validate_session_id};
+use dbus::blocking::Connection;
+use dbus::channel::{MatchingReceiver, Token};
+use dbus::message::MatchRule;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
-
-pub const BUS_NAME: &str = "org.decoupling.sessiond1";
-pub const INTERFACE_NAME: &str = "org.decoupling.sessiond1.Manager";
-pub const OBJECT_PATH: &str = "/org/decoupling/sessiond1";
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub const BUS_NAME: &str = "org.SGLogin.Sessiond1";
+pub const INTERFACE_NAME: &str = "org.SGLogin.Sessiond1.Manager";
+pub const OBJECT_PATH: &str = "/org/SGLogin/Sessiond1";
+pub const ERROR_PREFIX: &str = "org.SGLogin.Sessiond1.Error.";
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Bus {
     System,
     Session,
+    Address(String),
 }
-fn connect(bus: Bus) -> std::result::Result<Connection, dbus::Error> {
-    match bus {
-        Bus::System => Connection::new_system(),
-        Bus::Session => Connection::new_session(),
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Event {
+    SessionNew { sid: String, uid: u32 },
+    SessionRemoved { sid: String, uid: u32 },
+    OwnerReplaced,
+    Overflow,
+}
+#[derive(Default)]
+struct Events {
+    queue: VecDeque<Event>,
+    invalidated: bool,
+}
+impl Events {
+    fn invalidate(&mut self, reason: Event) {
+        self.invalidated = true;
+        self.queue.clear();
+        self.queue.push_back(reason);
     }
-}
-
-/// Root-side lifecycle publication. Signals intentionally have no well-known
-/// sender: listeners match type/interface/path/member, as PAM does not own the
-/// daemon name.
-pub struct BusLifecycleEvents {
-    bus: Bus,
-    connection: Mutex<Option<Connection>>,
-}
-impl BusLifecycleEvents {
-    pub fn system() -> Self {
-        Self::new(Bus::System)
-    }
-    pub fn new(bus: Bus) -> Self {
-        Self {
-            bus,
-            connection: Mutex::new(None),
+    fn lifecycle(&mut self, event: Event) {
+        if self.invalidated {
+            return;
+        }
+        if self.queue.len() >= 128 {
+            self.invalidate(Event::Overflow);
+        } else {
+            self.queue.push_back(event);
         }
     }
-    fn emit(&self, member: &str, session: &SessionIdentity) -> Result<()> {
-        let path = Path::new(OBJECT_PATH).expect("literal object path");
-        let interface = Interface::new(INTERFACE_NAME).expect("literal interface");
-        let member = Member::new(member).expect("literal member");
-        let mut message = Message::signal(&path, &interface, &member);
-        message = message.append2(session.id.as_str(), session.uid);
-        let mut connection = self
-            .connection
-            .lock()
-            .map_err(|_| Error::Transport("lifecycle bus mutex poisoned".into()))?;
-        if connection.is_none() {
-            *connection = Some(connect(self.bus).map_err(transport)?);
-        }
-        if connection
-            .as_ref()
-            .expect("connected lifecycle bus")
-            .send(message)
-            .is_err()
-        {
-            *connection = None;
-            return Err(Error::Transport("send lifecycle signal".into()));
-        }
-        connection
-            .as_ref()
-            .expect("connected lifecycle bus")
-            .channel()
-            .flush();
-        Ok(())
-    }
 }
-impl LifecycleEvents for BusLifecycleEvents {
-    fn session_new(&self, session: &SessionIdentity) -> Result<()> {
-        self.emit("SessionNew", session)
-    }
-    fn session_removed(&self, session: &SessionIdentity) -> Result<()> {
-        self.emit("SessionRemoved", session)
-    }
-}
-
-/// Blocking daemon client. Callers choose a finite transport timeout. A client
-/// timeout never cancels cleanup already accepted by the daemon.
+/// Owned by the creating process: never inherit/use after fork. Serialize access
+/// externally. Subscribe BEFORE querying; explicitly pump lifecycle hints. Any
+/// invalidation requires a NEW verified client/subscription and fresh inventory.
 pub struct Client {
     connection: Connection,
+    owner: String,
     timeout: Duration,
+    events: Arc<Mutex<Events>>,
+    subscribed: bool,
 }
 impl Client {
     pub fn system(timeout: Duration) -> Result<Self> {
         Self::new(Bus::System, timeout)
     }
     pub fn new(bus: Bus, timeout: Duration) -> Result<Self> {
-        if timeout.is_zero() {
-            return Err(Error::Transport("D-Bus timeout must be nonzero".into()));
+        if timeout.is_zero() || timeout > Duration::from_secs(3600) {
+            return Err(Error::new(
+                ErrorCode::InvalidArgument,
+                "timeout must be in (0, 1 hour]",
+            ));
+        }
+        let connection = match bus {
+            Bus::System => Connection::new_system(),
+            Bus::Session => Connection::new_session(),
+            Bus::Address(address) => {
+                let mut channel = dbus::channel::Channel::open_private(&address).map_err(remote)?;
+                channel.register().map_err(remote)?;
+                Ok(Connection::from(channel))
+            }
+        }
+        .map_err(remote)?;
+        let owner = name_owner(&connection, timeout)?;
+        let (uid,): (u32,) = bus_call(&connection, timeout, "GetConnectionUnixUser", (&owner,))?;
+        if uid != 0 {
+            return Err(Error::new(
+                ErrorCode::NotAuthorized,
+                "sessiond unique owner is not root",
+            ));
+        }
+        if name_owner(&connection, timeout)? != owner {
+            return Err(Error::new(
+                ErrorCode::Transport,
+                "sessiond owner changed during authentication",
+            ));
         }
         Ok(Self {
-            connection: connect(bus).map_err(transport)?,
+            connection,
+            owner,
             timeout,
+            events: Arc::default(),
+            subscribed: false,
         })
     }
-    fn proxy(&self) -> Proxy<'static, &Connection> {
+    fn valid(&self) -> Result<()> {
+        if self
+            .events
+            .lock()
+            .expect("event mutex poisoned")
+            .invalidated
+        {
+            return Err(Error::new(
+                ErrorCode::Transport,
+                "subscription invalidated; create a new verified client and query fresh inventory",
+            ));
+        }
+        Ok(())
+    }
+    fn rpc<R: dbus::arg::ReadAll, A: dbus::arg::AppendAll>(
+        &self,
+        method: &str,
+        args: A,
+    ) -> Result<R> {
+        self.valid()?;
         self.connection
-            .with_proxy(BUS_NAME, OBJECT_PATH, self.timeout)
+            .with_proxy(&self.owner, OBJECT_PATH, self.timeout)
+            .method_call(INTERFACE_NAME, method, args)
+            .map_err(remote)
+    }
+    pub fn list_sessions(&self) -> Result<Vec<SessionInfo>> {
+        let (rows,): (Vec<(String, u32, String)>,) = self.rpc("ListSessions", ())?;
+        Ok(rows.into_iter().map(info).collect())
+    }
+    pub fn get_session(&self, sid: &str) -> Result<SessionInfo> {
+        validate_session_id(sid)?;
+        let (row,) = self.rpc("GetSession", (sid,))?;
+        Ok(info(row))
+    }
+    pub fn get_session_by_pid(&self, pid: u32, start_time: u64) -> Result<SessionInfo> {
+        if pid == 0 || pid > i32::MAX as u32 {
+            return Err(Error::new(ErrorCode::InvalidArgument, "invalid PID"));
+        }
+        let (row,) = self.rpc("GetSessionByPid", (pid, start_time))?;
+        Ok(info(row))
+    }
+    pub fn get_session_master_pid(&self, sid: &str) -> Result<(u32, u64)> {
+        validate_session_id(sid)?;
+        self.rpc("GetSessionMasterPid", (sid,))
+    }
+    pub fn get_session_attrs(&self, sid: &str) -> Result<Attributes> {
+        validate_session_id(sid)?;
+        let (map,) = self.rpc("GetSessionAttrs", (sid,))?;
+        Ok(map)
+    }
+    pub fn get_session_attribute(&self, sid: &str, name: &str) -> Result<Option<String>> {
+        Ok(self.get_session_attrs(sid)?.remove(name))
+    }
+    pub fn ensure_session_ready(&self) -> Result<SessionInfo> {
+        let (row,) = self.rpc("EnsureSessionReady", ())?;
+        Ok(info(row))
+    }
+    pub fn update_session_attrs(
+        &self,
+        sid: &str,
+        set: &Attributes,
+        remove: &[String],
+    ) -> Result<()> {
+        validate_session_id(sid)?;
+        self.rpc("UpdateSessionAttrs", (sid, set, remove))
     }
     pub fn schedule_close_session(&self, sid: &str) -> Result<()> {
-        crate::validate_session_id(sid)?;
-        let _: () = self
-            .proxy()
-            .method_call(INTERFACE_NAME, "ScheduleCloseSession", (sid,))
-            .map_err(transport)?;
-        Ok(())
-    }
-    /// Compatibility method with scheduling-only semantics.
-    pub fn close_session_scheduled(&self, sid: &str) -> Result<()> {
-        crate::validate_session_id(sid)?;
-        let _: () = self
-            .proxy()
-            .method_call(INTERFACE_NAME, "CloseSession", (sid,))
-            .map_err(transport)?;
-        Ok(())
+        validate_session_id(sid)?;
+        self.rpc("ScheduleCloseSession", (sid,))
     }
     pub fn close_session(&self, sid: &str) -> Result<()> {
-        crate::validate_session_id(sid)?;
-        let _: () = self
-            .proxy()
-            .method_call(INTERFACE_NAME, "CloseSessionAndWait", (sid,))
-            .map_err(transport)?;
+        validate_session_id(sid)?;
+        self.rpc("CloseSession", (sid,))
+    }
+    pub fn subscribe(&mut self) -> Result<()> {
+        self.valid()?;
+        if self.subscribed {
+            return Ok(());
+        }
+        let mut matches = InstalledMatches {
+            connection: &self.connection,
+            timeout: self.timeout,
+            entries: Vec::new(),
+            committed: false,
+        };
+        let events = self.events.clone();
+        let mut rule = MatchRule::new_signal("org.freedesktop.DBus", "NameOwnerChanged");
+        rule.sender = Some("org.freedesktop.DBus".into());
+        rule.path = Some("/org/freedesktop/DBus".into());
+        matches.add(rule, move |message, _| {
+            if let Ok((name, _, _)) = message.read3::<String, String, String>()
+                && name == BUS_NAME
+            {
+                events
+                    .lock()
+                    .expect("event mutex poisoned")
+                    .invalidate(Event::OwnerReplaced);
+            }
+            true
+        })?;
+        for (member, added) in [("SessionNew", true), ("SessionRemoved", false)] {
+            let mut rule = MatchRule::new_signal(INTERFACE_NAME, member);
+            rule.sender = Some(self.owner.clone().into());
+            rule.path = Some(OBJECT_PATH.into());
+            let events = self.events.clone();
+            matches.add(rule, move |message, _| {
+                if let Ok((sid, uid)) = message.read2::<String, u32>()
+                    && validate_session_id(&sid).is_ok()
+                {
+                    events
+                        .lock()
+                        .expect("event mutex poisoned")
+                        .lifecycle(if added {
+                            Event::SessionNew { sid, uid }
+                        } else {
+                            Event::SessionRemoved { sid, uid }
+                        });
+                }
+                true
+            })?;
+        }
+        match name_owner(&self.connection, self.timeout) {
+            Ok(owner) if owner == self.owner => {}
+            _ => {
+                self.events
+                    .lock()
+                    .expect("event mutex poisoned")
+                    .invalidate(Event::OwnerReplaced);
+                return Err(Error::new(
+                    ErrorCode::Transport,
+                    "sessiond owner changed while subscribing",
+                ));
+            }
+        }
+        matches.committed = true;
+        self.subscribed = true;
         Ok(())
     }
-    pub fn list_sessions_legacy(&self) -> Result<Vec<(String, u32)>> {
-        let (sessions,): (Vec<(String, u32)>,) = self
-            .proxy()
-            .method_call(INTERFACE_NAME, "ListSessions", ())
-            .map_err(transport)?;
-        Ok(sessions)
+    /// NULL/None means no event yet, not completion of any lifecycle operation.
+    pub fn next_event(&self, wait: Duration) -> Result<Option<Event>> {
+        if !self.subscribed {
+            return Err(Error::new(
+                ErrorCode::InvalidArgument,
+                "subscribe before pumping events",
+            ));
+        }
+        if let Some(event) = self
+            .events
+            .lock()
+            .expect("event mutex poisoned")
+            .queue
+            .pop_front()
+        {
+            return Ok(Some(event));
+        }
+        self.connection
+            .process(wait.min(self.timeout))
+            .map_err(remote)?;
+        Ok(self
+            .events
+            .lock()
+            .expect("event mutex poisoned")
+            .queue
+            .pop_front())
     }
 }
-fn transport(error: impl std::fmt::Display) -> Error {
-    Error::Transport(error.to_string())
+// Failed subscriptions remove every provisional callback/rule; retry cannot
+// accumulate callbacks. All AddMatch/RemoveMatch calls use the chosen timeout.
+struct InstalledMatches<'a> {
+    connection: &'a Connection,
+    timeout: Duration,
+    entries: Vec<(Token, String)>,
+    committed: bool,
 }
-
+impl InstalledMatches<'_> {
+    fn add(
+        &mut self,
+        rule: MatchRule<'static>,
+        callback: impl FnMut(dbus::Message, &Connection) -> bool + Send + 'static,
+    ) -> Result<()> {
+        let text = rule.match_str();
+        let (): () = bus_call(self.connection, self.timeout, "AddMatch", (&text,))?;
+        let token = self.connection.start_receive(rule, Box::new(callback));
+        self.entries.push((token, text));
+        Ok(())
+    }
+}
+impl Drop for InstalledMatches<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            for (token, text) in self.entries.drain(..) {
+                self.connection.stop_receive(token);
+                let _: Result<()> =
+                    bus_call(self.connection, self.timeout, "RemoveMatch", (&text,));
+            }
+        }
+    }
+}
+fn bus_call<R: dbus::arg::ReadAll, A: dbus::arg::AppendAll>(
+    connection: &Connection,
+    timeout: Duration,
+    method: &str,
+    args: A,
+) -> Result<R> {
+    connection
+        .with_proxy("org.freedesktop.DBus", "/org/freedesktop/DBus", timeout)
+        .method_call("org.freedesktop.DBus", method, args)
+        .map_err(remote)
+}
+fn name_owner(connection: &Connection, timeout: Duration) -> Result<String> {
+    let (owner,) = bus_call(connection, timeout, "GetNameOwner", (BUS_NAME,))?;
+    Ok(owner)
+}
+fn info((sid, uid, runtime_dir): (String, u32, String)) -> SessionInfo {
+    SessionInfo {
+        sid,
+        uid,
+        runtime_dir,
+    }
+}
+fn remote(error: dbus::Error) -> Error {
+    let name = error.name().unwrap_or("");
+    let code = name
+        .strip_prefix(ERROR_PREFIX)
+        .map_or(ErrorCode::Transport, |local| {
+            ErrorCode::from_name(local).unwrap_or(ErrorCode::UnknownRemote)
+        });
+    Error {
+        code,
+        message: error.message().unwrap_or("D-Bus failure").to_owned(),
+        remote_name: error.name().map(str::to_owned),
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
-    fn protocol_names_remain_stable() {
-        assert_eq!(BUS_NAME, "org.decoupling.sessiond1");
-        assert_eq!(INTERFACE_NAME, "org.decoupling.sessiond1.Manager");
-        assert_eq!(OBJECT_PATH, "/org/decoupling/sessiond1");
+    fn overflow_is_bounded_invalidates_and_stops_accepting_hints() {
+        let mut state = Events::default();
+        for _ in 0..129 {
+            state.lifecycle(Event::SessionNew {
+                sid: "a".repeat(32),
+                uid: 1000,
+            });
+        }
+        assert!(state.invalidated);
+        assert_eq!(state.queue, VecDeque::from([Event::Overflow]));
+        state.lifecycle(Event::SessionRemoved {
+            sid: "a".repeat(32),
+            uid: 1000,
+        });
+        assert_eq!(state.queue.len(), 1);
+    }
+    #[test]
+    fn named_remote_and_transport_errors_are_not_lost_or_reclassified_as_absence() {
+        for (name, code) in [
+            (
+                "org.SGLogin.Sessiond1.Error.MasterNotRecorded",
+                ErrorCode::MasterNotRecorded,
+            ),
+            (
+                "org.SGLogin.Sessiond1.Error.FutureError",
+                ErrorCode::UnknownRemote,
+            ),
+            ("org.freedesktop.DBus.Error.NoReply", ErrorCode::Transport),
+        ] {
+            let error = remote(dbus::Error::new_custom(name, "test"));
+            assert_eq!(error.code, code);
+            assert_eq!(error.remote_name.as_deref(), Some(name));
+        }
     }
 }

@@ -1,111 +1,154 @@
 # sessiond
 
-Synchronous session lifecycle and daemonless cgroup-v2 containment.
+Local session creation and daemon-owned readiness, teardown and reconciliation.
+Linux cgroup-v2 containment is authoritative; there is no session database.
 
-## Workspace
+## Components and lifecycle
 
-- `lib-scoped`: explicit containment domains, tracked process identities,
-  signalling, subtree termination, and caller-owned blocking observation. It
-  has no D-Bus, locks, hidden threads, or automatic cleanup.
-- `lib-sessiond`: per-UID file locking, containment-derived inventory, local PAM
-  open, secure runtime handling, launcher coordination, synchronous D-Bus
-  clients/signals, and the daemon's complete teardown algorithm.
-- `pam_sessiond`: opens locally through `lib-sessiond`; on close it resolves its
-  current containment and asks the daemon to schedule teardown.
-- `sessiond`: blocking `dbus`/`dbus-crossroads` service with bounded cleanup and
-  reply workers plus one multi-watch observer thread.
-- `sessiond-user-launcher`: detached manager PAM host and manager child reaper.
-- `pam-ffi`: shared minimal Linux-PAM bindings.
+- **lib-scoped**: synchronous, daemonless, D-Bus/PAM-free containment, process
+  tracking, bounded opaque attributes and caller-driven observation.
+- **lib-sessiond**: synchronous local self-opening, shared protocol types,
+  blocking Rust client and dynamic C SDK. No executor or lifecycle locks.
+- **sessiond**: Tokio server, four fixed effect workers, bounded admission,
+  per-UID effect lanes, one observer and a root-controlled lifetime singleton
+  lock. Only the daemon reads full lifecycle configuration.
+- **pam-sessiond-core**: required local open and authoritative `XDG_SESSION_ID`;
+  close resolves current membership and schedules daemon teardown without waiting.
+- **pam-sessiond-ready**: optional readiness, supplied-seat attributes and validated
+  `XDG_RUNTIME_DIR`; close is a no-op.
+- **sessiond-user-launcher**: private synchronous PAM host, credential-exec stage
+  and foreground-manager reaper. It has no public SDK/scoped dependency.
 
-`pam_sessiond` accepts `fail_open`, `timeout=DURATION`, and an absolute
-`config=PATH` override (the default is `/etc/sessiond.conf`). The saved SID is
-convenience only; close always resolves the caller's current containment.
-
-There is no scoped daemon or `OpenSession` RPC. Authoritative session state is:
+`open_session(uid)` requires root, creates a new session, moves **only its caller**
+into it and records exact target `master`. It works without a daemon, account
+lookup, runtime directory or manager. SID/UID are local identity, not readiness.
+Already-contained callers (including nested members) get `AlreadyInSession`.
+Concurrent opens **within one process are unsupported**; no runtime guard is
+provided. Independent hosts may open concurrently for the same UID.
 
 ```text
 sessiond/user/<uid>/session/<sid>
 sessiond/user/<uid>/service
 ```
 
-Inventory is lock-free and reports SID, UID, and the recorded leader identity
-without probing liveness. Startup discovery is read-only and never sweeps old
-state. Close scheduling/coalescing and completion results exist only in daemon
-memory.
+Logical UID comes from this root-controlled ancestry, not master credentials,
+filesystem ownership, environment or attributes. Inventory includes partial and
+closing roots; it does not probe master liveness or certify readiness. Runtime
+path is a first-class field, with master tracking and opaque attributes queried
+separately. Generic attributes, including SID/runtime-like names, are inert.
 
 ## D-Bus
 
-The retained interface is:
-
 ```text
-org.decoupling.sessiond1
-/org/decoupling/sessiond1
-org.decoupling.sessiond1.Manager
+org.SGLogin.Sessiond1
+/org/SGLogin/Sessiond1
+org.SGLogin.Sessiond1.Manager
 ```
 
-Methods:
+See [`dist/dbus/org.SGLogin.Sessiond1.xml`](dist/dbus/org.SGLogin.Sessiond1.xml).
+The complete methods are `ListSessions`, `GetSession`, `GetSessionByPid`,
+`GetSessionMasterPid`, `GetSessionAttrs`, `EnsureSessionReady`,
+`UpdateSessionAttrs`, `ScheduleCloseSession` and `CloseSession`. There are no
+legacy endpoints, aliases or remote-open method.
 
-- `CloseSession`: scheduling-only compatibility method;
-- `ScheduleCloseSession`: scheduling-only;
-- `CloseSessionAndWait`: blocking administrative completion;
-- `ListSessions`: legacy SID/UID adapter over containment inventory.
+Mutations require root. Readiness additionally requires the bus's authenticated
+**ProcessFD** connection credential; a numeric bus PID is never a substitute.
+A bus lacking ProcessFD fails readiness before effects, but does not prevent
+local opening or ordinary queries. Readiness derives/pins caller membership,
+observes its recorded master and ensures runtime/eligible manager under its UID
+lane. Failure alone does not close a valid caller session.
 
-Mutating methods verify root bus credentials. `SessionNew` may be sent directly
-by a root PAM connection, while `SessionRemoved` is sent by daemon cleanup.
-Listeners must match type/interface/path/member without a sender constraint.
+`ScheduleCloseSession` accepts/coalesces cleanup with configured natural-exit
+grace (default 10s, zero disables grace). Repeated schedules never extend the
+first deadline; actual master exit or `CloseSession` bypasses remaining grace.
+`CloseSession` waits for actual **session-tree removal only**, not subsequent
+manager/runtime cleanup. Blocking close from inside the target subtree is
+rejected. Pending/timeouts/disconnects do not cancel admitted effects. Queues and
+reply waiters are bounded; overload returns `Busy`.
 
-## Manager startup
+Only the daemon emits `SessionNew` after successful readiness and `SessionRemoved`
+after actual tree removal. Local opening, startup discovery and attribute patches
+do not emit new-session signals. Hints are best effort, not durable/exactly-once
+records; seat attributes may be installed after `SessionNew`. Clients pin a
+verified root unique owner, subscribe before querying and pump explicitly.
+Owner replacement or overflow requires a new verified client and fresh inventory.
 
-`user_service_manager.min_uid` defaults to **1000**. Below that UID, opening a
-session still creates containment and the runtime directory and publishes the
-normal PAM environment, but skips all manager startup/reuse/replacement work.
-Such sessions do not require a working manager executable or a writable home.
-Set `min_uid = 0` to enable managers for every UID. A threshold change does not
-stop an existing manager; normal last-session cleanup remains unchanged.
+## Reconciliation and restart
 
-For eligible UIDs, a new manager is launched only when no recorded live `manager`
-PAM host can be reused. The launcher pins the service-scope generation, detaches after exec,
-self-migrates, separately assigns target `manager`, opens its private PAM
-session, starts the configured manager as the target user, and reports one-byte
-manager readiness. The original PAM host reaps only the short-lived helper.
+Startup, readiness and completed removal reconcile current roots under the UID
+lane. Live exact masters retain resources and are watched; exited/reused masters
+are closed immediately. Missing tracking retains a root provisionally until its
+actual directory **mtime is at least ten seconds old**, when failed initialization
+is expired even if its host stalled alive. Future mtimes are not expired.
+Malformed records/I/O failures are errors, not invented absence or death.
 
-The manager executable is selected at build time with
-`SESSIOND_USER_SERVICE_MANAGER` and defaults to
-`/usr/libexec/user-service-manager`. It is invoked as:
+Re-inventory before shared cleanup. With no sessions or linger retention, drain
+and remove the manager first, remove runtime last, then prune empty containers.
+A runtime deletion failure retains the UID container for later discovery. There
+is no autonomous retry loop, cleanup journal or unrelated-domain sweep. A host
+that dies before contacting sessiond may wait until the next normal trigger.
+
+Grace deadlines/completion results are memory-only. Restart discovers actual
+state and dead masters but does not restore a still-live host's old grace intent;
+that host can need a new explicit close. A singleton lock is retained until
+accepted effects quiesce even on bus loss. Live manager workers survive daemon
+loss and are reused through exact service-master tracking, not restarted blindly.
+Orphan adoption/reaping belongs to the parent subreaper/PID 1; a new daemon cannot
+wait for an already-adopted unrelated child. The private harness verifies this
+with its own subreaper. Direct children remain reaped while their daemon lives.
+
+## Manager and configuration
+
+See [`dist/sessiond.conf`](dist/sessiond.conf). Default `min_uid = 1000` skips
+manager work below the threshold, **not runtime setup or existing-resource
+cleanup**. Zero enables every UID. Below-threshold readiness does not require a
+working launcher/manager or writable home. NSS lookup runs in a fresh exec'd
+helper, never an async/blocking worker's address space.
+
+For eligible UIDs, reuse a live service `master`; otherwise fully drain stale
+service state before replacement. The daemon places/records its direct worker
+before authorizing private PAM. Arbitrary PAM runs only after that exec/gate;
+credential changes run in another exec stage with controlled environment and FD
+inheritance. The manager supplies an actual readiness byte and is reaped using
+its own transferred pidfd, not recycled numeric-PID/process-group authority.
+
+Select the foreground manager at build time with
+`SESSIOND_USER_SERVICE_MANAGER` (default `/usr/libexec/user-service-manager`):
 
 ```text
 user-service-manager --ready-fd 3
 ```
 
-The private PAM service defaults to `sessiond-user` and is configurable as
-`user_service_manager.pam_service`. No user bus address is synthesized.
+The private PAM service defaults to `sessiond-user`; it must not include either
+public module or `sessiond-session`. See [`dist/pam/README.md`](dist/pam/README.md).
+No module synthesizes `DBUS_SESSION_BUS_ADDRESS`.
 
-## Build and test
+## Build and validation
 
 ```sh
+cargo build --workspace --locked
 cargo fmt --all -- --check
-cargo test --workspace
+cargo test --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
+./tests/pam-syslog.sh
+./tests/private-bus.sh
 ```
 
-Real cgroup tests for `lib-scoped` are opt-in and require an explicitly
-throwaway delegated parent:
+SDK ABI/staging instructions: [`crates/lib-sessiond/README.md`](crates/lib-sessiond/README.md).
+The private-bus test uses ordinary directory fixtures, not real-cgroup evidence.
+PAM tests use private configuration only; no installed PAM/service changes.
+Build as an ordinary user. Root phases use already-built artifacts and
+noninteractive `sudo`; missing prerequisites return **77 (skip)**, not success.
+
+Real-cgroup tests require an **explicitly supplied disposable delegated parent**:
 
 ```sh
 LIB_SCOPED_TEST_ROOT=/sys/fs/cgroup/DISPOSABLE_PARENT \
   cargo test -p lib-scoped --test cgroup -- --ignored
+LIB_SCOPED_TEST_ROOT=/sys/fs/cgroup/DISPOSABLE_PARENT ./tests/root-e2e.sh
 ```
 
-Root integration tests use a private bus and disposable cgroup tree. The main
-scenario covers concurrent opens, daemon restart with stale initial discovery,
-leader-exit observation, optional-PAM manager-start failure, scheduled PAM
-close, and blocking administrative close:
-
-```sh
-./tests/root-e2e.sh
-./tests/pam-syslog.sh
-```
-
-They require passwordless `sudo`; missing prerequisites return status 77.
-Distribution service/activation cutover is intentionally outside this source
-migration.
+The root harness uses only a fresh child of that parent and a private mount
+namespace for private PAM, verifies local open/readiness/PAM/restart/manager reuse,
+FD/credential boundaries and subtree drain. It never guesses a live hierarchy.
+No build or synthetic/headless test establishes deployment or desktop acceptance.

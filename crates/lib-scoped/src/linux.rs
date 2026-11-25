@@ -545,6 +545,65 @@ impl ScopeHandle {
         self.domain
             .assign_in(&self.directory, &self.scope, target, pid)
     }
+
+    fn validate_instance(&self) -> Result<()> {
+        ensure_linked(&self.directory)?;
+        if self.domain.scope_identity(&self.scope)? != Some(self.instance) {
+            return Err(Error::io(
+                "validate pinned scope",
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "scope generation was removed or replaced",
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Read one complete attribute version; never follows a replacement scope.
+    pub fn get_attributes(&self) -> Result<crate::Attributes> {
+        self.validate_instance()?;
+        let map = crate::attributes::read(&self.directory)?;
+        self.validate_instance()?;
+        Ok(map)
+    }
+
+    pub fn get_attribute(&self, name: &str) -> Result<Option<String>> {
+        Ok(self.get_attributes()?.remove(name))
+    }
+
+    /// Atomic whole-map publication. Caller serializes read/modify/write patches.
+    pub fn replace_attributes(&self, map: &crate::Attributes) -> Result<()> {
+        self.validate_instance()?;
+        crate::attributes::replace(&self.directory, map)?;
+        self.validate_instance()
+    }
+
+    /// Directory mtime, not birth time or a refreshed observation timestamp.
+    pub fn modified_at(&self) -> Result<crate::Timestamp> {
+        self.validate_instance()?;
+        let metadata = self
+            .directory
+            .metadata()
+            .map_err(|e| Error::io("stat modified_at", e))?;
+        let nanoseconds = u32::try_from(metadata.mtime_nsec()).map_err(|_| {
+            Error::io(
+                "decode modified_at",
+                io::Error::new(io::ErrorKind::InvalidData, "invalid mtime nanoseconds"),
+            )
+        })?;
+        if nanoseconds >= 1_000_000_000 {
+            return Err(Error::io(
+                "decode modified_at",
+                io::Error::new(io::ErrorKind::InvalidData, "invalid mtime nanoseconds"),
+            ));
+        }
+        self.validate_instance()?;
+        Ok(crate::Timestamp {
+            seconds: metadata.mtime(),
+            nanoseconds,
+        })
+    }
 }
 fn ensure_linked(dir: &File) -> Result<()> {
     let metadata = dir

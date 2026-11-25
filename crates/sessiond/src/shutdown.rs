@@ -99,7 +99,7 @@ pub(crate) fn shutdown<B: Backend>(
             backend.terminate_target(scope, primary)?;
         }
         if let Some(watch) = &mut target
-            && !watch.wait_exited(config.leader_timeout)?
+            && !watch.wait_exited(config.master_timeout)?
         {
             backend.kill_target(scope, primary)?;
         }
@@ -265,18 +265,18 @@ mod tests {
         shutdown(
             fake,
             &ScopeId::parse("test/a").unwrap(),
-            &TargetId::parse("leader").unwrap(),
+            &TargetId::parse("master").unwrap(),
             &ShutdownConfig {
                 mode,
-                leader_timeout: Duration::from_secs(7),
+                master_timeout: Duration::from_secs(7),
                 scope_timeout: Duration::from_secs(11),
             },
         )
     }
     #[test]
-    fn leader_mode_signals_target_then_subtree_and_removes_deepest_first() {
+    fn master_mode_signals_target_then_subtree_and_removes_deepest_first() {
         let fake = Fake::new();
-        assert!(run(&fake, ShutdownMode::Leader).unwrap().is_empty());
+        assert!(run(&fake, ShutdownMode::Master).unwrap().is_empty());
         assert_eq!(
             fake.log(),
             [
@@ -313,9 +313,9 @@ mod tests {
     #[test]
     fn every_termination_error_immediately_escalates() {
         for (mode, action) in [
-            (ShutdownMode::Leader, "term-target"),
+            (ShutdownMode::Master, "term-target"),
             (ShutdownMode::Scope, "term-scope"),
-            (ShutdownMode::Leader, "term-scope"),
+            (ShutdownMode::Master, "term-scope"),
         ] {
             let fake = Fake::new();
             fake.0.borrow_mut().fail = Some(action);
@@ -330,7 +330,7 @@ mod tests {
     fn missing_tracking_goes_straight_to_subtree_and_scope_wait() {
         let fake = Fake::new();
         fake.0.borrow_mut().tracked = false;
-        assert!(!run(&fake, ShutdownMode::Leader).unwrap().is_empty());
+        assert!(!run(&fake, ShutdownMode::Master).unwrap().is_empty());
         let log = fake.log();
         assert!(
             !log.iter()
@@ -357,7 +357,7 @@ mod tests {
     fn empty_scope_skips_signalling_and_query_errors_never_prove_drain() {
         let fake = Fake::new();
         fake.0.borrow_mut().empty = true;
-        run(&fake, ShutdownMode::Leader).unwrap();
+        run(&fake, ShutdownMode::Master).unwrap();
         assert!(
             !fake
                 .log()
@@ -366,7 +366,7 @@ mod tests {
         );
         let fake = Fake::new();
         fake.0.borrow_mut().fail = Some("query-empty");
-        assert!(run(&fake, ShutdownMode::Leader).is_err());
+        assert!(run(&fake, ShutdownMode::Master).is_err());
         assert!(!fake.log().iter().any(|s| s.starts_with("remove:")));
     }
     #[test]
@@ -374,7 +374,7 @@ mod tests {
         let fake = Fake::new();
         fake.0.borrow_mut().target_exited = false;
         fake.0.borrow_mut().fail = Some("kill-target");
-        run(&fake, ShutdownMode::Leader).unwrap();
+        run(&fake, ShutdownMode::Master).unwrap();
         assert!(
             fake.log()
                 .windows(2)
@@ -386,7 +386,7 @@ mod tests {
         assert!(run(&fake, ShutdownMode::Scope).is_err());
         let fake = Fake::new();
         fake.0.borrow_mut().fail = Some("remove:test/a/nested/deep");
-        assert!(run(&fake, ShutdownMode::Leader).is_err());
+        assert!(run(&fake, ShutdownMode::Master).is_err());
         assert!(!fake.log().iter().any(|s| s == "remove:test/a"));
     }
 }

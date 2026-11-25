@@ -8,13 +8,20 @@ rust-version.workspace = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
-dbus.workspace = true
-dbus-crossroads.workspace = true
+humantime.workspace = true
+futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 libc.workspace = true
 lib-scoped.workspace = true
-lib-sessiond.workspace = true
+lib-sessiond = { workspace = true, default-features = false, features = ["wire-serde"] }
+nix.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+tokio = { version = "1.47", features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal"] }
+zbus = { version = "=5.13.2", default-features = false, features = ["tokio"] }
 
 [dev-dependencies]
 tempfile = "3"
+lib-sessiond = { workspace = true, features = ["local-open", "blocking-client"] }

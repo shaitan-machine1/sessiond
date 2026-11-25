@@ -1,5 +1,5 @@
 use crate::{Error, Result};
-use lib_scoped::{Domain, ProcessIdentity, ScopeId, TargetId, well_known};
+use lib_scoped::{Domain, ScopeId, well_known};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionIdentity {
@@ -7,13 +7,7 @@ pub struct SessionIdentity {
     pub uid: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Session {
-    pub id: String,
-    pub uid: u32,
-    /// Recorded identity only. No process-existence/membership probe.
-    pub leader: Option<ProcessIdentity>,
-}
+pub type Session = SessionIdentity;
 
 pub fn validate_session_id(id: &str) -> Result<()> {
     if id.len() == 32
@@ -27,7 +21,7 @@ pub fn validate_session_id(id: &str) -> Result<()> {
     }
 }
 
-fn user_roots(domain: &Domain) -> Result<Vec<(u32, ScopeId)>> {
+pub(crate) fn user_roots(domain: &Domain) -> Result<Vec<(u32, ScopeId)>> {
     let mut roots = Vec::new();
     for scope in domain.list_children(&ScopeId::parse("sessiond/user").expect("literal scope"))? {
         let Some(raw) = scope.segments().next_back() else {
@@ -50,18 +44,15 @@ pub(crate) fn session_roots(domain: &Domain, uid: u32) -> Result<Vec<ScopeId>> {
 
 pub(crate) fn list(domain: &Domain) -> Result<Vec<Session>> {
     let mut sessions = Vec::new();
-    let leader = TargetId::parse("leader").expect("literal target");
     for (uid, _) in user_roots(domain)? {
         for scope in session_roots(domain, uid)? {
             let id = scope.segments().next_back().expect("validated scope");
             if validate_session_id(id).is_err() {
                 continue;
             }
-            let recorded = domain.read_target_identity(&scope, &leader)?;
             sessions.push(Session {
                 id: id.to_owned(),
                 uid,
-                leader: recorded,
             });
         }
     }
@@ -149,8 +140,7 @@ mod tests {
             core.list_sessions().unwrap(),
             vec![Session {
                 id: SID.into(),
-                uid: 1000,
-                leader: None
+                uid: 1000
             }]
         );
         assert!(!root.path().join("must-not-touch").exists());
@@ -170,7 +160,7 @@ mod tests {
         assert_eq!(core.list_sessions().unwrap().len(), 1);
     }
     #[test]
-    fn nested_membership_resolves_session_root_without_leader_tracking() {
+    fn nested_membership_resolves_session_root_without_master_tracking() {
         let scope =
             ScopeId::parse(format!("sessiond/user/1000/session/{SID}/nested/worker")).unwrap();
         assert_eq!(

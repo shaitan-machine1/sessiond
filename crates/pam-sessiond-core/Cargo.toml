@@ -1,0 +1,17 @@
+[package]
+name = "pam-sessiond-core"
+version.workspace = true
+# pamsm 0.5.5 emits pre-2024 no_mangle attributes. Keep only the modules on 2021.
+edition = "2021"
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "pam_sessiond_core"
+crate-type = ["cdylib"]
+
+[dependencies]
+humantime.workspace = true
+lib-sessiond = { workspace = true, features = ["local-open", "blocking-client"] }
+nix.workspace = true
+pamsm = { version = "=0.5.5", features = ["libpam"] }

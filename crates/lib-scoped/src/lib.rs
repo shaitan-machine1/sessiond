@@ -6,16 +6,48 @@
 //! Linux requires cgroup v2, pidfds, cgroup.kill and cgroup directory xattrs.
 //! The cgroup mount and /proc must describe the same cgroup/PID namespaces.
 
+mod attributes;
 mod ids;
 mod linux;
 mod observer;
 mod process;
 
+pub use attributes::{
+    Attributes, MAX_ATTRIBUTE_BYTES, MAX_ATTRIBUTE_NAME_BYTES, MAX_ATTRIBUTE_VALUE_BYTES,
+    MAX_ATTRIBUTES, validate_attributes,
+};
 pub use ids::*;
 pub use linux::{Domain, ScopeHandle, ScopeIdentity};
 pub use observer::{Event, EventKind, Observer, ObserverControl, ScopeWatch, TargetWatch, Watch};
 pub use process::{ProcessHandle, ProcessIdentity, read_start_time};
 use std::io;
+
+/// Filesystem timestamp, seconds since the Unix epoch plus nanoseconds.
+/// Negative seconds are representable; no precision is discarded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Timestamp {
+    pub seconds: i64,
+    pub nanoseconds: u32,
+}
+
+impl Timestamp {
+    pub fn to_system_time(self) -> Option<std::time::SystemTime> {
+        use std::time::{Duration, UNIX_EPOCH};
+        if self.nanoseconds >= 1_000_000_000 {
+            return None;
+        }
+        let nanos = Duration::from_nanos(u64::from(self.nanoseconds));
+        if self.seconds >= 0 {
+            UNIX_EPOCH
+                .checked_add(Duration::from_secs(self.seconds as u64))?
+                .checked_add(nanos)
+        } else {
+            UNIX_EPOCH
+                .checked_sub(Duration::from_secs(self.seconds.unsigned_abs()))?
+                .checked_add(nanos)
+        }
+    }
+}
 
 pub type Pid = u32;
 pub type Result<T> = std::result::Result<T, Error>;

@@ -101,7 +101,7 @@ impl Drop for Fixture {
     }
 }
 fn target() -> TargetId {
-    TargetId::parse("leader").unwrap()
+    TargetId::parse("master").unwrap()
 }
 
 #[test]
@@ -267,7 +267,7 @@ fn kill_and_removal_do_not_depend_on_valid_target_metadata() {
         .domain
         .assign_target(&scope, &target(), pid)
         .unwrap();
-    let name = c"user.scoped.target.leader";
+    let name = c"user.scoped.target.master";
     let path =
         std::ffi::CString::new(fixture.root.join("a").as_os_str().as_encoded_bytes()).unwrap();
     let bad = b"broken";

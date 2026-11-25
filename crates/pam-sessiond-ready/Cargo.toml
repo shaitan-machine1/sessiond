@@ -1,0 +1,16 @@
+[package]
+name = "pam-sessiond-ready"
+version.workspace = true
+# pamsm 0.5.5 entry-point macro requires pre-2024 no_mangle spelling.
+edition = "2021"
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "pam_sessiond_ready"
+crate-type = ["cdylib"]
+
+[dependencies]
+humantime.workspace = true
+lib-sessiond = { workspace = true, features = ["blocking-client"] }
+pamsm = { version = "=0.5.5", features = ["libpam"] }

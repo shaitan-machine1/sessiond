@@ -1,0 +1,18 @@
+<!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS Object Introspection 1.0//EN" "http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd">
+<node name="/org/SGLogin/Sessiond1">
+  <interface name="org.SGLogin.Sessiond1.Manager">
+    <method name="ListSessions"><arg name="sessions" type="a(sus)" direction="out"/></method>
+    <method name="GetSession"><arg name="sid" type="s" direction="in"/><arg name="session" type="(sus)" direction="out"/></method>
+    <method name="GetSessionByPid"><arg name="pid" type="u" direction="in"/><arg name="start_time" type="t" direction="in"/><arg name="session" type="(sus)" direction="out"/></method>
+    <method name="GetSessionMasterPid"><arg name="sid" type="s" direction="in"/><arg name="pid" type="u" direction="out"/><arg name="start_time" type="t" direction="out"/></method>
+    <method name="GetSessionAttrs"><arg name="sid" type="s" direction="in"/><arg name="attributes" type="a{ss}" direction="out"/></method>
+    <method name="EnsureSessionReady"><arg name="session" type="(sus)" direction="out"/></method>
+    <method name="UpdateSessionAttrs"><arg name="sid" type="s" direction="in"/><arg name="set" type="a{ss}" direction="in"/><arg name="remove" type="as" direction="in"/></method>
+    <method name="ScheduleCloseSession"><arg name="sid" type="s" direction="in"/></method>
+    <method name="CloseSession"><arg name="sid" type="s" direction="in"/></method>
+    <signal name="SessionNew"><arg name="sid" type="s"/><arg name="uid" type="u"/></signal>
+    <signal name="SessionRemoved"><arg name="sid" type="s"/><arg name="uid" type="u"/></signal>
+  </interface>
+  <interface name="org.freedesktop.DBus.Introspectable"><method name="Introspect"><arg name="xml" type="s" direction="out"/></method></interface>
+  <interface name="org.freedesktop.DBus.Peer"><method name="Ping"/><method name="GetMachineId"><arg name="machine_id" type="s" direction="out"/></method></interface>
+</node>

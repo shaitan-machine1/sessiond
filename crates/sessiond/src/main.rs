@@ -1,28 +1,14 @@
 use clap::{Parser, ValueEnum};
-use lib_sessiond::SessionCore;
-use lib_sessiond::bus::{Bus, BusLifecycleEvents};
-use lib_sessiond::config::Config;
-use sessiond::scheduler::Scheduler;
+use sessiond::{SessionCore, config::Config, locking::Singleton, scheduler::Scheduler};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
-
-static STOPPING: AtomicBool = AtomicBool::new(false);
-extern "C" fn stop(_: libc::c_int) {
-    STOPPING.store(true, Ordering::Relaxed);
-}
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum BusChoice {
     System,
     Session,
-}
-impl From<BusChoice> for Bus {
-    fn from(value: BusChoice) -> Self {
-        match value {
-            BusChoice::System => Bus::System,
-            BusChoice::Session => Bus::Session,
-        }
-    }
 }
 #[derive(Debug, Parser)]
 struct Args {
@@ -30,44 +16,70 @@ struct Args {
     config: PathBuf,
     #[arg(long, value_enum, default_value = "system", hide = true)]
     bus: BusChoice,
+    #[arg(long, hide = true)]
+    lookup_gid: Option<u32>,
 }
 fn main() -> anyhow::Result<()> {
+    let args = Args::parse();
+    // A fresh exec'd NSS helper never constructs the daemon's runtime, bus or
+    // global state and never calls NSS on a Tokio/blocking worker thread.
+    if let Some(uid) = args.lookup_gid {
+        use nix::unistd::{Uid, User};
+        let user =
+            User::from_uid(Uid::from_raw(uid))?.ok_or_else(|| anyhow::anyhow!("unknown UID"))?;
+        println!("{}", user.gid.as_raw());
+        return Ok(());
+    }
+    // SAFETY: daemon-only policy, before runtime/worker creation. Ignored
+    // SIGCHLD survives exec; undo it to retain exclusive direct-child ownership.
+    unsafe {
+        anyhow::ensure!(libc::geteuid() == 0, "sessiond requires effective UID 0");
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = libc::SIG_DFL;
+        libc::sigemptyset(&mut action.sa_mask);
+        if libc::sigaction(libc::SIGCHLD, &action, std::ptr::null_mut()) < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "sessiond=info".into()),
         )
         .init();
-    install_signals()?;
-    let args = Args::parse();
+    // Unexpected panics in any daemon worker are fatal bugs, not silent loss of
+    // a fixed worker/UID lane. This changes only this daemon process's policy.
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic| {
+        previous(panic);
+        std::process::abort();
+    }));
     let config = if args.config.exists() {
         Config::load(&args.config)?
     } else {
         Config::default()
     };
-    let bus = args.bus.into();
-    let core =
-        std::sync::Arc::new(SessionCore::new(config)?.with_events(BusLifecycleEvents::new(bus)));
-    let scheduler = Scheduler::new(core);
-    let (hint_sender, hint_receiver) = mpsc::sync_channel(1);
-    let observer = sessiond::observation::start(scheduler.clone(), hint_receiver, &STOPPING)?;
-    let result = sessiond::dbus::serve(bus, scheduler, hint_sender, &STOPPING);
-    STOPPING.store(true, Ordering::Relaxed);
-    let _ = observer.join();
-    result
-}
-fn install_signals() -> std::io::Result<()> {
-    // SAFETY: installed handlers only set a lock-free AtomicBool. This daemon
-    // owns its process signal policy; no host application is affected.
-    unsafe {
-        for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
-            let mut action: libc::sigaction = std::mem::zeroed();
-            action.sa_sigaction = stop as *const () as usize;
-            libc::sigemptyset(&mut action.sa_mask);
-            if libc::sigaction(signal, &action, std::ptr::null_mut()) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-        }
-    }
-    Ok(())
+    let _lifetime = Singleton::acquire(&config.state_dir)?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async move {
+        let (signals, receiver) = tokio::sync::mpsc::channel(128);
+        let core = Arc::new(SessionCore::with_signals(config, signals)?);
+        let scheduler = Scheduler::new(core);
+        let stopping = Arc::new(AtomicBool::new(false));
+        let observer = sessiond::observation::start(scheduler.clone(), stopping.clone())?;
+        let result = sessiond::dbus::serve(
+            matches!(args.bus, BusChoice::Session),
+            scheduler.clone(),
+            receiver,
+        )
+        .await;
+        // Keep the lifetime lock held until every admitted effect has completed.
+        // Grace deadlines are not reset; accepted cleanup remains owned here.
+        scheduler.shutdown();
+        stopping.store(true, Ordering::Relaxed);
+        observer.join().expect("observer panicked");
+        result
+    })
 }

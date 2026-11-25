@@ -66,6 +66,23 @@ a failed watch token without consuming other watches' completions. An unchanged
 readiness notification cannot cause an unbounded busy loop. Only
 `TargetExited` and `ScopeEmpty` are completion event kinds.
 
+## Attributes and timestamps
+
+Pinned `ScopeHandle`s expose `get_attribute`, `get_attributes` and atomic
+`replace_attributes`. Maps are domain-neutral UTF-8 strings, stored as one
+versioned `user.scoped.attributes` xattr. Missing storage is an empty map, not
+scope absence. Malformed/unsupported records are errors. A removed or replaced
+scope is an error; the handle never follows a replacement path. Read/modify/write
+patches require caller-owned writer serialization, not a library lock.
+
+Limits are 128 entries, 255-byte nonempty names, 4096-byte values and 16 KiB total
+encoded storage. Embedded NULs are rejected. Similar names such as `runtime_dir`
+and `XDG_SEAT` have no special meaning. Attributes and target records are separate.
+
+`modified_at` returns directory mtime as `Timestamp { seconds: i64,
+nanoseconds: u32 }`, precisely representing Unix-epoch filesystem time. It does
+not report birth time, introduce policy, or refresh timestamps on reads.
+
 ## Validation
 
 ```sh

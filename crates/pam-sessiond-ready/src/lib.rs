@@ -1,4 +1,6 @@
-use lib_sessiond::{bus::Client, Attributes, SessionInfo};
+#[cfg(test)]
+use lib_sessiond::Attributes;
+use lib_sessiond::{bus::Client, SessionInfo};
 use pamsm::{pam_module, LogLvl, Pam, PamError, PamFlags, PamLibExt, PamServiceModule};
 use std::time::Duration;
 
@@ -52,14 +54,10 @@ impl Environment for PamEnvironment<'_> {
 }
 trait Readiness {
     fn ensure(&self) -> lib_sessiond::Result<SessionInfo>;
-    fn update(&self, sid: &str, attrs: &Attributes) -> lib_sessiond::Result<()>;
 }
 impl Readiness for Client {
     fn ensure(&self) -> lib_sessiond::Result<SessionInfo> {
         self.ensure_session_ready()
-    }
-    fn update(&self, sid: &str, attrs: &Attributes) -> lib_sessiond::Result<()> {
-        self.update_session_attrs(sid, attrs, &[])
     }
 }
 fn timeout(args: &[String]) -> Result<Duration, Failure> {
@@ -93,9 +91,6 @@ fn perform<T: Readiness>(
     }
     let client = connect()?;
     let info = client.ensure()?;
-    if let Some(seat) = env.get("XDG_SEAT")? {
-        client.update(&info.sid, &Attributes::from([("XDG_SEAT".into(), seat)]))?;
-    }
     env.put(&format!("XDG_RUNTIME_DIR={}", info.runtime_dir))?;
     Ok(())
 }
@@ -148,7 +143,6 @@ mod tests {
     }
     struct Transport {
         fail_ready: bool,
-        fail_attrs: bool,
     }
     impl Readiness for Transport {
         fn ensure(&self) -> lib_sessiond::Result<SessionInfo> {
@@ -163,19 +157,6 @@ mod tests {
                 uid: 1000,
                 runtime_dir: "/validated/runtime/1000".into(),
             })
-        }
-        fn update(&self, _: &str, attrs: &Attributes) -> lib_sessiond::Result<()> {
-            assert_eq!(
-                attrs,
-                &Attributes::from([("XDG_SEAT".into(), "supplied-seat".into())])
-            );
-            if self.fail_attrs {
-                return Err(lib_sessiond::Error::new(
-                    lib_sessiond::ErrorCode::BackendError,
-                    "attribute failure",
-                ));
-            }
-            Ok(())
         }
     }
     fn env() -> Env {
@@ -205,24 +186,14 @@ mod tests {
         assert_eq!(env.get("UNRELATED").unwrap().as_deref(), Some("keep"));
     }
     #[test]
-    fn readiness_and_attribute_failures_do_not_restore_supplied_runtime() {
-        for (fail_ready, fail_attrs) in [(true, false), (false, true)] {
+    fn readiness_failures_do_not_restore_supplied_runtime() {
+        {
             let env = env();
-            assert!(perform(&env, || Ok(Transport {
-                fail_ready,
-                fail_attrs
-            }))
-            .is_err());
+            assert!(perform(&env, || Ok(Transport { fail_ready: true })).is_err());
             assert!(env.get("XDG_RUNTIME_DIR").unwrap().is_none());
         }
         let env = env();
-        perform(&env, || {
-            Ok(Transport {
-                fail_ready: false,
-                fail_attrs: false,
-            })
-        })
-        .unwrap();
+        perform(&env, || Ok(Transport { fail_ready: false })).unwrap();
         assert_eq!(
             env.get("XDG_RUNTIME_DIR").unwrap().as_deref(),
             Some("/validated/runtime/1000")
@@ -232,13 +203,7 @@ mod tests {
     fn publication_failure_leaves_runtime_absent_without_undoing_core_identity() {
         let mut env = env();
         env.fail_publish = true;
-        let error = perform(&env, || {
-            Ok(Transport {
-                fail_ready: false,
-                fail_attrs: false,
-            })
-        })
-        .unwrap_err();
+        let error = perform(&env, || Ok(Transport { fail_ready: false })).unwrap_err();
         assert_eq!(error.status, PamError::BUF_ERR);
         assert!(env.get("XDG_RUNTIME_DIR").unwrap().is_none());
         assert_eq!(

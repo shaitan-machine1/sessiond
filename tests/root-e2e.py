@@ -156,7 +156,12 @@ scope_timeout = "200ms"
         first, sid = host(pam=True)
         assert scope(sid).exists() and not (work / "runtime").exists()
         assert command(first, "ready")[0] == "ERROR" and first.poll() is None
+        failedhost, hidden_sid = host(pam=True)
         start(launcher="/definitely/missing/sessiond-launcher")
+        assert call("ListSessions") == [[]]
+        assert command(failedhost, "quit") == ["CLOSED", "0"]
+        assert failedhost.wait(timeout=5) == 0
+        wait_for(lambda: not scope(hidden_sid).exists(), "optional readiness failure followed by caller-resolved close")
         original = ready(first)
         assert ready(first) == original
         assert command(first, "attrs") == original
@@ -181,8 +186,12 @@ scope_timeout = "200ms"
         downhost.wait(timeout=5)
         assert scope(sid).exists()
         start()
-        wait_for(lambda: not scope(sid).exists(), "death during daemon downtime")
-        # Recent untracked roots retain; fixed age cleanup on next discovery.
+        assert scope(sid).exists() and call("ListSessions") == [[]]
+        trigger, trigger_sid = host()
+        ready(trigger)
+        close(trigger_sid, trigger)
+        wait_for(lambda: not scope(sid).exists(), "closure-triggered cleanup of death during daemon downtime")
+        # Recent untracked roots survive; age expiry alone never triggers cleanup.
         partial = uuid.uuid4().hex
         session_parent = root / "sessiond/user" / str(uid) / "session"
         session_parent.mkdir(parents=True, exist_ok=True)
@@ -193,7 +202,11 @@ scope_timeout = "200ms"
         time.sleep(10.1)
         stop()
         start()
-        wait_for(lambda: not scope(partial).exists(), "expired initializer discovery")
+        assert scope(partial).exists()
+        trigger, trigger_sid = host()
+        ready(trigger)
+        close(trigger_sid, trigger)
+        wait_for(lambda: not scope(partial).exists(), "expired initializer cleanup at next actual closure")
         stop()
         # Eligible manager: actual ready byte, UID/GID, FD/secret isolation,
         # reuse across sessions AND daemon death; no duplicate manager.

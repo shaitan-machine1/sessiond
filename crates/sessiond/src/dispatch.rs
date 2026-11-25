@@ -15,8 +15,6 @@ pub async fn serve(
     scheduler: Scheduler,
     mut signals: tokio::sync::mpsc::Receiver<Signal>,
 ) -> anyhow::Result<()> {
-    let permit = scheduler.admit()?;
-    let uids = scheduler.execute(permit, None, |core| core.uids()).await?;
     let builder = if session_bus {
         zbus::connection::Builder::session()?
     } else {
@@ -44,9 +42,8 @@ pub async fn serve(
         ),
         "sessiond bus name is already owned"
     );
-    for uid in uids {
-        scheduler.reconcile(uid);
-    }
+    // Manager child reaping is not session-master observation or reconciliation.
+    let mut reap = tokio::time::interval(Duration::from_millis(50));
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut hup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
     let emitter_connection = connection.clone();
@@ -68,6 +65,7 @@ pub async fn serve(
         tokio::select! {
             _ = tokio::signal::ctrl_c() => break Ok(()),
             _ = term.recv() => break Ok(()),
+            _ = reap.tick() => scheduler.core().reap_workers(),
             _ = hup.recv() => break Ok(()),
             Some(result) = calls.join_next(), if !calls.is_empty() => check_task(result),
             next = messages.next() => {

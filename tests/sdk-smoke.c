@@ -29,24 +29,18 @@ int main(int argc, char **argv) {
         ok(sessiond_subscribe(client, &error), &error);
         ok(sessiond_list_sessions(client, &rows, &error), &error);
         if (argc > 2) {
-            assert(rows->length == 1 && strcmp(rows->items[0].sid, argv[2]) == 0);
-            ok(sessiond_get_session(client, argv[2], &session, &error), &error);
-            assert(session->uid == 1000 && session->runtime_dir && session->sid);
-            sessiond_session_free(session); session = NULL;
+            assert(rows->length == 0); /* Partial fixture roots are private. */
+            assert(sessiond_get_session(client, argv[2], &session, &error) == SESSIOND_SESSION_NOT_FOUND);
+            assert(session == NULL); sessiond_error_free(error); error = NULL;
             uint32_t pid = 0; uint64_t master_start = 0;
-            assert(sessiond_get_session_master_pid(client, argv[2], &pid, &master_start, &error) == SESSIOND_MASTER_NOT_RECORDED);
-            assert(error && strcmp(error->remote_name, "org.SGLogin.Sessiond1.Error.MasterNotRecorded") == 0);
+            assert(sessiond_get_session_master_pid(client, argv[2], &pid, &master_start, &error) == SESSIOND_SESSION_NOT_FOUND);
             sessiond_error_free(error); error = NULL;
-            sessiond_attribute set[] = {{"XDG_SEAT", "supplied-seat"}, {"runtime_dir", "/inert"}};
-            ok(sessiond_update_session_attrs(client, argv[2], set, 2, NULL, 0, &error), &error);
             sessiond_attributes *attrs = NULL;
-            ok(sessiond_get_session_attrs(client, argv[2], &attrs, &error), &error);
-            assert(attrs->length == 2); sessiond_attributes_free(attrs);
-            const char *remove[] = {"XDG_SEAT", "missing-key"};
-            ok(sessiond_update_session_attrs(client, argv[2], NULL, 0, remove, 2, &error), &error);
-            ok(sessiond_get_session_attrs(client, argv[2], &attrs, &error), &error);
-            assert(attrs->length == 1 && strcmp(attrs->items[0].name, "runtime_dir") == 0);
-            sessiond_attributes_free(attrs);
+            assert(sessiond_get_session_attrs(client, argv[2], &attrs, &error) == SESSIOND_SESSION_NOT_FOUND);
+            assert(attrs == NULL); sessiond_error_free(error); error = NULL;
+            sessiond_attribute set[] = {{"ready", "1"}};
+            assert(sessiond_update_session_attrs(client, argv[2], set, 1, NULL, 0, &error) == SESSIOND_INVALID_ARGUMENT);
+            sessiond_error_free(error); error = NULL;
         } else assert(rows->length == 0);
         sessiond_sessions_free(rows);
         assert(sessiond_get_session_by_pid(client, (uint32_t)getpid(), start + 1, &session, &error) == SESSIOND_PROCESS_CHANGED);
@@ -58,7 +52,9 @@ int main(int argc, char **argv) {
         assert(code == SESSIOND_NO_SESSION || code == SESSIOND_READINESS_FAILED);
         sessiond_error_free(error); error = NULL;
         const char *absent = "f123456789abcdef0123456789abcdef";
-        ok(sessiond_schedule_close_session(client, absent, &error), &error);
+        code = sessiond_schedule_close_session(client, &error);
+        assert(code == SESSIOND_NO_SESSION || code == SESSIOND_READINESS_FAILED);
+        sessiond_error_free(error); error = NULL;
         code = sessiond_close_session(client, absent, &error);
         assert(code == 0 || code == SESSIOND_READINESS_FAILED);
         if (code) { sessiond_error_free(error); error = NULL; }

@@ -6,11 +6,14 @@ use std::path::PathBuf;
 #[derive(Debug, Clone)]
 pub struct OpenOptions {
     pub cgroup_root: PathBuf,
+    /// Initial opaque attributes, installed locally before readiness. `ready` is reserved.
+    pub initial_attributes: crate::Attributes,
 }
 impl Default for OpenOptions {
     fn default() -> Self {
         Self {
             cgroup_root: "/sys/fs/cgroup".into(),
+            initial_attributes: crate::Attributes::new(),
         }
     }
 }
@@ -41,6 +44,15 @@ pub fn open_session_with_options(uid: u32, options: &OpenOptions) -> Result<Open
             "cgroup_root must be absolute and NUL-free",
         ));
     }
+    if options.initial_attributes.contains_key("ready") {
+        return Err(Error::new(
+            ErrorCode::InvalidArgument,
+            "ready is daemon-owned",
+        ));
+    }
+    let mut bounded = options.initial_attributes.clone();
+    bounded.insert("ready".into(), "1".into());
+    lib_scoped::validate_attributes(&bounded)?;
     let domain = Domain::create(&options.cgroup_root, "sessiond")?;
     if let Some(scope) = domain.scope_of(std::process::id())? {
         let parts: Vec<_> = scope.segments().collect();
@@ -86,6 +98,7 @@ pub fn open_session_with_options(uid: u32, options: &OpenOptions) -> Result<Open
             &TargetId::parse("master").expect("literal target"),
             std::process::id(),
         )?;
+        pinned.replace_attributes(&options.initial_attributes)?;
         return Ok(OpenedSession { sid, uid });
     }
     Err(Error::new(

@@ -162,6 +162,7 @@ pub unsafe extern "C" fn sessiond_open_session(
             } else {
                 OpenOptions {
                     cgroup_root: input(root)?.into(),
+                    ..OpenOptions::default()
                 }
             };
             let opened = crate::open_session_with_options(uid, &options)?;
@@ -389,11 +390,76 @@ macro_rules! close_call {
         }
     };
 }
-close_call!(sessiond_schedule_close_session, schedule_close_session);
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sessiond_schedule_close_session(
+    value: *mut Client,
+    error: *mut *mut CError,
+) -> u32 {
+    unsafe { finish(error, || client(value)?.schedule_close_session()) }
+}
 close_call!(sessiond_close_session, close_session);
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sessiond_subscribe(value: *mut Client, error: *mut *mut CError) -> u32 {
     unsafe { finish(error, || client(value)?.subscribe()) }
+}
+/// Borrowed poll descriptor; valid until client destruction. timeout_ms=-1
+/// means no transport timer, buffered=1 requires immediate dispatch.
+#[repr(C)]
+pub struct CPollState {
+    pub fd: i32,
+    pub events: i16,
+    pub buffered: u32,
+    pub timeout_ms: i64,
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sessiond_poll_state(
+    value: *mut Client,
+    result: *mut CPollState,
+    error: *mut *mut CError,
+) -> u32 {
+    unsafe {
+        finish(error, || {
+            if result.is_null() {
+                return Err(Error::new(ErrorCode::InvalidArgument, "null poll output"));
+            }
+            *result = CPollState {
+                fd: -1,
+                events: 0,
+                buffered: 0,
+                timeout_ms: -1,
+            };
+            let (watch, buffered, _) = client(value)?.poll_state();
+            *result = CPollState {
+                fd: watch.fd,
+                events: (if watch.read { libc::POLLIN } else { 0 })
+                    | (if watch.write { libc::POLLOUT } else { 0 }),
+                buffered: u32::from(buffered),
+                timeout_ms: -1,
+            };
+            Ok(())
+        })
+    }
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sessiond_dispatch(
+    value: *mut Client,
+    limit: u32,
+    more: *mut u32,
+    error: *mut *mut CError,
+) -> u32 {
+    unsafe {
+        finish(error, || {
+            if more.is_null() {
+                return Err(Error::new(
+                    ErrorCode::InvalidArgument,
+                    "null dispatch output",
+                ));
+            }
+            *more = 0;
+            *more = u32::from(client(value)?.dispatch(limit as usize)?);
+            Ok(())
+        })
+    }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sessiond_next_event(

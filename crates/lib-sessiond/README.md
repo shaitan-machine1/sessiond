@@ -7,7 +7,9 @@ lifecycle lock. Full lifecycle policy belongs to the sessiond daemon.
 
 - `open_session(uid)` / `open_session_with_options(uid, &OpenOptions)` locally
   create containment, move only the privileged caller and record exact `master`.
-  `OpenedSession` supplies SID/UID, not runtime/manager readiness.
+  `OpenedSession` supplies SID/UID, not runtime/manager readiness. OpenOptions
+  accepts initial_attributes locally, rejects reserved `ready`, and reserves
+  capacity for the daemon's marker; PAM core supplies only XDG_SEAT.
 - `OpenOptions.cgroup_root` defaults to `/sys/fs/cgroup`; use an explicit absolute
   disposable root for tests. No bus/account lookup is needed to open.
 - Already-contained masters **or members**, including nested scopes and different
@@ -19,7 +21,8 @@ lifecycle lock. Full lifecycle policy belongs to the sessiond daemon.
 - Call `ensure_session_ready()` separately after opening. It resolves the actual
   connection process, requiring the bus's authenticated ProcessFD. Missing bus
   support is an explicit readiness failure, not a numeric-PID fallback.
-- `schedule_close_session` accepts/coalesces natural-exit grace; `close_session`
+- `schedule_close_session()` takes no SID and resolves its authenticated caller's
+  private membership, including unready scopes, for configured close grace; `close_session`
   waits only for session-tree removal, not shared-resource cleanup. Pending,
   timeout or disconnect is not successful cleanup and does not cancel effects.
 - Clients verify/pin the daemon's **root unique owner**. Use an explicit
@@ -28,6 +31,14 @@ lifecycle lock. Full lifecycle policy belongs to the sessiond daemon.
   authenticated `SessionNew`/`SessionRemoved` hints are accepted. Owner change or
   bounded-queue overflow invalidates the client: create a new verified client,
   subscribe and query fresh inventory. Hints are not durable/exactly-once logs.
+
+All public metadata queries expose only scope + ready=1 + recorded exact-live-
+master sessions. Invalid roots are absent, not client-filtered raw inventory.
+`poll_state()` exposes borrowed descriptor/interests, buffered readiness and an
+optional transport timeout (currently None: no asynchronous pending RPC timers).
+`dispatch(limit)` processes at most 1..256 messages nonblockingly; consume queued
+events too. The C equivalents are sessiond_poll_state/sessiond_dispatch. These
+hooks are caller-owned, not a hidden loop, and RPCs have per-request timeouts.
 
 Client connections belong to their creating process; do not inherit/use them
 across fork. Serialize access externally. No public pidfd/process-identity type

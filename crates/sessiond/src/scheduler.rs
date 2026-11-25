@@ -4,7 +4,7 @@ use crate::{
     SessionCore,
     core::{CloseCompletion, failure},
 };
-use lib_scoped::{ScopeHandle, ScopeIdentity, TargetStatus};
+use lib_scoped::{ScopeHandle, ScopeIdentity};
 use lib_sessiond::{Error, ErrorCode, Result};
 use std::any::Any;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -179,7 +179,7 @@ impl Scheduler {
         let Some(session) = self.core().find_session(sid)? else {
             return Ok(None);
         };
-        let (domain, _, scope) = self.core().session_scope(sid)?;
+        let (_, _, scope) = self.core().session_scope(sid)?;
         {
             let mut state = self.inner.state.lock().expect("scheduler poisoned");
             if state.closes.get(sid).is_some_and(|close| {
@@ -206,21 +206,11 @@ impl Scheduler {
                 return Ok(Some(close.completion.clone()));
             }
         }
-        let mut grace = if immediate {
+        let grace = if immediate {
             Duration::ZERO
         } else {
             self.core().config().session.close_grace
         };
-        if !immediate {
-            match domain.target_status(scope.id(), &crate::core::master()) {
-                Ok(TargetStatus::Running(_)) => self.core().observation.arm(&domain, &session)?,
-                Ok(TargetStatus::Exited(_)) => grace = Duration::ZERO,
-                Ok(TargetStatus::Untracked) => {}
-                Err(error) => {
-                    tracing::warn!(%error, sid, "cannot observe scheduled master; explicit deadline still applies")
-                }
-            }
-        }
         let deadline = now
             .checked_add(grace)
             .ok_or_else(|| failure(ErrorCode::InvalidArgument, "close deadline overflow"))?;

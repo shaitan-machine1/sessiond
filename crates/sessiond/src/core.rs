@@ -98,7 +98,6 @@ pub struct SessionCore {
     pub(crate) config: Config,
     pub(crate) completions: Mutex<std::collections::HashMap<String, Arc<CloseCompletion>>>,
     pub(crate) children: Mutex<Vec<Child>>,
-    pub(crate) observation: Arc<crate::observation::Observation>,
     signals: tokio::sync::mpsc::Sender<Signal>,
 }
 impl SessionCore {
@@ -117,7 +116,6 @@ impl SessionCore {
             config,
             completions: Mutex::new(std::collections::HashMap::new()),
             children: Mutex::new(Vec::new()),
-            observation: Arc::new(crate::observation::Observation::new()?),
             signals,
         })
     }
@@ -138,10 +136,15 @@ impl SessionCore {
         }
     }
     pub fn list_infos(&self) -> Result<Vec<SessionInfo>> {
-        self.list_sessions()?
-            .into_iter()
-            .map(|row| self.info(&row.id, row.uid))
-            .collect()
+        let mut result = Vec::new();
+        for row in self.list_sessions()? {
+            match self.get_session(&row.id) {
+                Ok(info) => result.push(info),
+                Err(e) if e.public().code == ErrorCode::SessionNotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(result)
     }
     pub fn find_session(&self, sid: &str) -> Result<Option<inventory::SessionIdentity>> {
         inventory::validate_session_id(sid)?;
@@ -188,13 +191,56 @@ impl SessionCore {
         }
         let found =
             found.ok_or_else(|| failure(ErrorCode::NoSession, "process is outside a session"))?;
-        self.info(&found.id, found.uid)
+        self.get_session(&found.id).map_err(|e| {
+            if e.public().code == ErrorCode::SessionNotFound {
+                failure(ErrorCode::NoSession, "membership is not a valid session")
+            } else {
+                e
+            }
+        })
+    }
+    /// Private caller resolution deliberately includes unready/hidden scopes.
+    pub fn caller_scope(&self, caller: &crate::auth::Caller) -> Result<(SessionInfo, ScopeHandle)> {
+        caller.validate()?;
+        let row = self
+            .session_for_process(caller.pid())?
+            .ok_or_else(|| failure(ErrorCode::NoSession, "caller is outside a session"))?;
+        let (_, current, pinned) = self.session_scope(&row.id)?;
+        caller.validate()?;
+        if current != row || self.session_for_process(caller.pid())?.as_ref() != Some(&row) {
+            return Err(failure(
+                ErrorCode::ProcessChanged,
+                "caller membership changed",
+            ));
+        }
+        Ok((self.info(&row.id, row.uid)?, pinned))
+    }
+    fn public_snapshot(
+        &self,
+        sid: &str,
+    ) -> Result<(inventory::SessionIdentity, Attributes, (u32, u64))> {
+        let (domain, row, pinned) = self.session_scope(sid)?;
+        let attrs = pinned.get_attributes().map_err(session_lookup_error)?;
+        let absent = || failure(ErrorCode::SessionNotFound, "session is not publicly valid");
+        let identity = domain
+            .read_target_identity(pinned.id(), &master())
+            .map_err(session_lookup_error)?
+            .ok_or_else(absent)?;
+        if attrs.get("ready").map(String::as_str) != Some("1")
+            || !matches!(domain.target_status(pinned.id(), &master()).map_err(session_lookup_error)?, TargetStatus::Running(p) if p == identity)
+            || domain.scope_identity(pinned.id())? != Some(pinned.identity())
+            || domain
+                .read_target_identity(pinned.id(), &master())
+                .map_err(session_lookup_error)?
+                != Some(identity)
+        {
+            return Err(absent());
+        }
+        Ok((row, attrs, (identity.pid, identity.start_time)))
     }
     pub fn get_session(&self, sid: &str) -> Result<SessionInfo> {
-        let found = self
-            .find_session(sid)?
-            .ok_or_else(|| failure(ErrorCode::SessionNotFound, "session not found"))?;
-        self.info(sid, found.uid)
+        let (row, _, _) = self.public_snapshot(sid)?;
+        self.info(sid, row.uid)
     }
     pub(crate) fn info(&self, sid: &str, uid: u32) -> Result<SessionInfo> {
         let runtime_dir = self
@@ -225,24 +271,10 @@ impl SessionCore {
         Ok((domain, row, pinned))
     }
     pub fn get_master(&self, sid: &str) -> Result<(u32, u64)> {
-        let (domain, _, pinned) = self.session_scope(sid)?;
-        let identity = domain
-            .read_target_identity(pinned.id(), &master())
-            .map_err(session_lookup_error)?
-            .ok_or_else(|| failure(ErrorCode::MasterNotRecorded, "master is not recorded"))?;
-        if domain.scope_identity(pinned.id())? != Some(pinned.identity()) {
-            return Err(failure(
-                ErrorCode::SessionNotFound,
-                "session generation disappeared",
-            ));
-        }
-        Ok((identity.pid, identity.start_time))
+        Ok(self.public_snapshot(sid)?.2)
     }
     pub fn get_attrs(&self, sid: &str) -> Result<Attributes> {
-        self.session_scope(sid)?
-            .2
-            .get_attributes()
-            .map_err(Into::into)
+        Ok(self.public_snapshot(sid)?.1)
     }
     pub fn update_attrs(
         &self,
@@ -250,6 +282,18 @@ impl SessionCore {
         set: Attributes,
         remove: Vec<String>,
     ) -> Result<()> {
+        if set.contains_key("ready") || remove.iter().any(|name| name == "ready") {
+            return Err(failure(ErrorCode::InvalidArgument, "ready is daemon-owned"));
+        }
+        let domain = self
+            .domain()?
+            .ok_or_else(|| failure(ErrorCode::SessionNotFound, "session domain removed"))?;
+        if domain.scope_identity(pinned.id())? != Some(pinned.identity()) {
+            return Err(failure(
+                ErrorCode::SessionNotFound,
+                "session generation removed",
+            ));
+        }
         lib_scoped::validate_attributes(&set)
             .map_err(|e| failure(ErrorCode::InvalidArgument, e.to_string()))?;
         if remove.len() > lib_scoped::MAX_ATTRIBUTES
@@ -270,7 +314,9 @@ impl SessionCore {
             map.remove(&name);
         }
         map.extend(set);
-        lib_scoped::validate_attributes(&map)
+        let mut reserved = map.clone();
+        reserved.insert("ready".into(), "1".into());
+        lib_scoped::validate_attributes(&reserved)
             .map_err(|e| failure(ErrorCode::LimitExceeded, e.to_string()))?;
         pinned.replace_attributes(&map)?;
         Ok(())
@@ -282,7 +328,7 @@ impl SessionCore {
         expected_scope: ScopeHandle,
     ) -> Result<SessionInfo> {
         caller.validate()?;
-        let initial = self.session_by_pid(caller.pid(), caller.start_time())?;
+        let (initial, _) = self.caller_scope(&caller)?;
         if initial.sid != expected.sid || initial.uid != expected.uid {
             return Err(failure(
                 ErrorCode::ProcessChanged,
@@ -304,16 +350,15 @@ impl SessionCore {
                 "caller membership changed",
             ));
         }
-        match domain.target_status(pinned.id(), &master())? {
-            TargetStatus::Running(_) => self.observation.arm(&domain, &session)?,
+        let expected_master = match domain.target_status(pinned.id(), &master())? {
+            TargetStatus::Running(identity) => identity,
             _ => {
                 return Err(failure(
                     ErrorCode::NotReady,
                     "session has no live recorded master",
                 ));
             }
-        }
-        self.reconcile(session.uid)?;
+        };
         caller.validate()?;
         if domain.scope_identity(pinned.id())? != Some(pinned.identity()) {
             return Err(failure(
@@ -326,6 +371,9 @@ impl SessionCore {
         for warning in startup::ensure_manager(self, &domain, session.uid, &runtime)? {
             tracing::warn!(%warning, "manager readiness warning");
         }
+        let info = self.info(&session.id, session.uid)?;
+        let mut attrs = pinned.get_attributes()?;
+        attrs.insert("ready".into(), "1".into());
         caller.validate()?;
         if domain.scope_identity(pinned.id())? != Some(pinned.identity())
             || self.session_for_process(caller.pid())?.as_ref() != Some(&session)
@@ -337,18 +385,21 @@ impl SessionCore {
         }
         if !matches!(
             domain.target_status(pinned.id(), &master())?,
-            TargetStatus::Running(_)
+            TargetStatus::Running(identity) if identity == expected_master
         ) {
             return Err(failure(
                 ErrorCode::NotReady,
                 "session master exited during readiness",
             ));
         }
+        // The marker is the final fallible initialization step; never undo it
+        // for reply/signal loss or a later ordinary process-exit race.
+        pinned.replace_attributes(&attrs)?;
         self.emit(Signal::New {
-            sid: session.id.clone(),
+            sid: session.id,
             uid: session.uid,
         });
-        self.info(&session.id, session.uid)
+        Ok(info)
     }
     pub fn close_tree(&self, sid: &str, expected: Option<ScopeIdentity>) -> Result<()> {
         let result = self.close_tree_inner(sid, expected);
@@ -378,15 +429,22 @@ impl SessionCore {
         {
             return Ok(());
         }
+        let was_ready = domain
+            .pin_scope(&root)?
+            .get_attributes()?
+            .get("ready")
+            .map(String::as_str)
+            == Some("1");
         for warning in shutdown::shutdown(&domain, &root, &master(), &self.config.session.shutdown)?
         {
             tracing::warn!(%warning, sid, "session teardown warning");
         }
-        self.observation.remove(sid);
-        self.emit(Signal::Removed {
-            sid: sid.to_owned(),
-            uid: row.uid,
-        });
+        if was_ready {
+            self.emit(Signal::Removed {
+                sid: sid.to_owned(),
+                uid: row.uid,
+            });
+        }
         Ok(())
     }
     pub fn uids(&self) -> Result<Vec<u32>> {
@@ -397,6 +455,20 @@ impl SessionCore {
                 .collect()),
             None => Ok(Vec::new()),
         }
+    }
+    fn has_valid_sessions(&self, uid: u32) -> Result<bool> {
+        for row in self
+            .list_sessions()?
+            .into_iter()
+            .filter(|row| row.uid == uid)
+        {
+            match self.get_session(&row.id) {
+                Ok(_) => return Ok(true),
+                Err(e) if e.public().code == ErrorCode::SessionNotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(false)
     }
     pub fn reconcile(&self, uid: u32) -> Result<()> {
         let Some(domain) = self.domain()? else {
@@ -413,13 +485,7 @@ impl SessionCore {
                 Err(e) => return Err(e.into()),
             };
             match domain.target_status(&root, &master())? {
-                TargetStatus::Running(_) => self.observation.arm(
-                    &domain,
-                    &inventory::SessionIdentity {
-                        id: sid.to_owned(),
-                        uid,
-                    },
-                )?,
+                TargetStatus::Running(_) => {}
                 TargetStatus::Exited(_) => self.close_tree(sid, Some(pinned.identity()))?,
                 TargetStatus::Untracked => {
                     let modified = pinned.modified_at()?;
@@ -433,7 +499,7 @@ impl SessionCore {
                 }
             }
         }
-        if self.config.linger || !inventory::session_roots(&domain, uid)?.is_empty() {
+        if self.config.linger || self.has_valid_sessions(uid)? {
             return Ok(());
         }
         let service = well_known::sessiond_user_service(uid);
@@ -445,11 +511,16 @@ impl SessionCore {
         )? {
             tracing::warn!(%warning, uid, "manager cleanup warning");
         }
-        if !inventory::session_roots(&domain, uid)?.is_empty() {
+        if self.has_valid_sessions(uid)? {
             return Ok(());
         }
         // Any runtime error exits BEFORE final UID pruning, preserving discovery.
         runtime::remove(&self.config.runtime_parent, uid)?;
+        // Invalid roots do not retain shared resources, but their ancestors
+        // cannot be pruned while any physical session scope remains.
+        if !inventory::session_roots(&domain, uid)?.is_empty() {
+            return Ok(());
+        }
         for root in [
             well_known::sessiond_user_session_root(uid),
             well_known::sessiond_user_root(uid),

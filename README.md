@@ -10,11 +10,11 @@ Linux cgroup-v2 containment is authoritative; there is no session database.
 - **lib-sessiond**: synchronous local self-opening, shared protocol types,
   blocking Rust client and dynamic C SDK. No executor or lifecycle locks.
 - **sessiond**: Tokio server, four fixed effect workers, bounded admission,
-  per-UID effect lanes, one observer and a root-controlled lifetime singleton
+  per-UID effect lanes and a root-controlled lifetime singleton
   lock. Only the daemon reads full lifecycle configuration.
 - **pam-sessiond-core**: required local open and authoritative `XDG_SESSION_ID`;
   close resolves current membership and schedules daemon teardown without waiting.
-- **pam-sessiond-ready**: optional readiness, supplied-seat attributes and validated
+- **pam-sessiond-ready**: optional-in-PAM readiness and validated
   `XDG_RUNTIME_DIR`; close is a no-op.
 - **sessiond-user-launcher**: private synchronous PAM host, credential-exec stage
   and foreground-manager reaper. It has no public SDK/scoped dependency.
@@ -32,10 +32,16 @@ sessiond/user/<uid>/service
 ```
 
 Logical UID comes from this root-controlled ancestry, not master credentials,
-filesystem ownership, environment or attributes. Inventory includes partial and
-closing roots; it does not probe master liveness or certify readiness. Runtime
+filesystem ownership, environment or attributes. Private inventory includes every
+scope. Public metadata exposes a session only when its scope exists, protected
+`ready=1` is stored, and its recorded exact master is alive. Unready/dead-master
+roots are absent from public queries, without query-triggered cleanup. Runtime
 path is a first-class field, with master tracking and opaque attributes queried
 separately. Generic attributes, including SID/runtime-like names, are inert.
+`ready` is the sole reserved key: only sessiond commits it. Initial local SDK
+attributes reserve space for it; PAM core copies only supplied `XDG_SEAT` before
+readiness. Required-core failure returns a PAM error; its dedicated host must end
+rather than continue or reuse the failed session host.
 
 ## D-Bus
 
@@ -51,16 +57,19 @@ The complete methods are `ListSessions`, `GetSession`, `GetSessionByPid`,
 `UpdateSessionAttrs`, `ScheduleCloseSession` and `CloseSession`. There are no
 legacy endpoints, aliases or remote-open method.
 
-Mutations require root. Readiness additionally requires the bus's authenticated
+Mutations require root. Readiness and caller-resolved scheduled close require the bus's authenticated
 **ProcessFD** connection credential; a numeric bus PID is never a substitute.
 A bus lacking ProcessFD fails readiness before effects, but does not prevent
-local opening or ordinary queries. Readiness derives/pins caller membership,
-observes its recorded master and ensures runtime/eligible manager under its UID
-lane. Failure alone does not close a valid caller session.
+local opening or ordinary queries. Readiness privately resolves/pins even an
+unready caller, ensures runtime/eligible manager under its UID lane, prepares its
+result and validates caller/scope/master before atomically committing `ready=1`
+as its final fallible initialization step. Lost replies do not undo that commit.
+Manager failure alone does not invalidate an already-ready session.
 
-`ScheduleCloseSession` accepts/coalesces cleanup with configured natural-exit
-grace (default 10s, zero disables grace). Repeated schedules never extend the
-first deadline; actual master exit or `CloseSession` bypasses remaining grace.
+`ScheduleCloseSession()` takes no SID: it resolves the authenticated caller's
+private enclosing scope and returns after bounded admission, even if that scope
+is unready. Configured close grace defaults to 10s; zero disables grace. Retries
+never extend the first deadline. `CloseSession(sid)` bypasses remaining grace.
 `CloseSession` waits for actual **session-tree removal only**, not subsequent
 manager/runtime cleanup. Blocking close from inside the target subtree is
 rejected. Pending/timeouts/disconnects do not cancel admitted effects. Queues and
@@ -69,27 +78,34 @@ reply waiters are bounded; overload returns `Busy`.
 Only the daemon emits `SessionNew` after successful readiness and `SessionRemoved`
 after actual tree removal. Local opening, startup discovery and attribute patches
 do not emit new-session signals. Hints are best effort, not durable/exactly-once
-records; seat attributes may be installed after `SessionNew`. Clients pin a
+records; initial PAM seat copying precedes `SessionNew`. Never-ready tree removal
+emits no external lifecycle signal. Clients pin a
 verified root unique owner, subscribe before querying and pump explicitly.
 Owner replacement or overflow requires a new verified client and fresh inventory.
 
 ## Reconciliation and restart
 
-Startup, readiness and completed removal reconcile current roots under the UID
-lane. Live exact masters retain resources and are watched; exited/reused masters
-are closed immediately. Missing tracking retains a root provisionally until its
-actual directory **mtime is at least ten seconds old**, when failed initialization
-is expired even if its host stalled alive. Future mtimes are not expired.
+Only actual session closure triggers/coalesces separate per-UID reconciliation.
+Startup, local open, readiness, queries and master death do not trigger it.
+Session masters are not continuously watched: their exit immediately makes a
+session publicly invalid and cleanup-eligible, but removal waits for a normal
+closure-triggered pass or explicit/scheduled close. Missing tracking is eligible
+when its directory **mtime is at least ten seconds old**; younger/future mtimes
+are not expired. Live unready hosts are not killed merely for unreadiness.
 Malformed records/I/O failures are errors, not invented absence or death.
+A reconciliation pass is fail-fast, has no autonomous retry, and does not enqueue
+another pass for its own closures. A later external closure triggers a new pass.
 
-Re-inventory before shared cleanup. With no sessions or linger retention, drain
-and remove the manager first, remove runtime last, then prune empty containers.
+Re-inventory before shared cleanup. With no valid sessions or linger retention, drain
+and remove the manager first, remove runtime last, then prune only empty
+containers. Invalid roots do not retain shared resources, but their ancestors
+must remain while those roots physically exist.
 A runtime deletion failure retains the UID container for later discovery. There
 is no autonomous retry loop, cleanup journal or unrelated-domain sweep. A host
 that dies before contacting sessiond may wait until the next normal trigger.
 
-Grace deadlines/completion results are memory-only. Restart discovers actual
-state and dead masters but does not restore a still-live host's old grace intent;
+Grace deadlines/completion results are memory-only. Restart queries actual
+scope/marker/master state without running reconciliation or restoring grace intent;
 that host can need a new explicit close. A singleton lock is retained until
 accepted effects quiesce even on bus loss. Live manager workers survive daemon
 loss and are reused through exact service-master tracking, not restarted blindly.

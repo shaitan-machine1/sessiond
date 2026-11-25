@@ -3,6 +3,7 @@ use crate::{Attributes, Error, ErrorCode, Result, SessionInfo, validate_session_
 use dbus::blocking::Connection;
 use dbus::channel::{MatchingReceiver, Token};
 use dbus::message::MatchRule;
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -54,6 +55,7 @@ pub struct Client {
     timeout: Duration,
     events: Arc<Mutex<Events>>,
     subscribed: bool,
+    buffered: Cell<bool>,
 }
 impl Client {
     pub fn system(timeout: Duration) -> Result<Self> {
@@ -66,16 +68,18 @@ impl Client {
                 "timeout must be in (0, 1 hour]",
             ));
         }
-        let connection = match bus {
-            Bus::System => Connection::new_system(),
-            Bus::Session => Connection::new_session(),
+        let mut channel = match bus {
+            Bus::System => dbus::channel::Channel::get_private(dbus::channel::BusType::System),
+            Bus::Session => dbus::channel::Channel::get_private(dbus::channel::BusType::Session),
             Bus::Address(address) => {
                 let mut channel = dbus::channel::Channel::open_private(&address).map_err(remote)?;
                 channel.register().map_err(remote)?;
-                Ok(Connection::from(channel))
+                Ok(channel)
             }
         }
         .map_err(remote)?;
+        channel.set_watch_enabled(true);
+        let connection = Connection::from(channel);
         let owner = name_owner(&connection, timeout)?;
         let (uid,): (u32,) = bus_call(&connection, timeout, "GetConnectionUnixUser", (&owner,))?;
         if uid != 0 {
@@ -96,6 +100,7 @@ impl Client {
             timeout,
             events: Arc::default(),
             subscribed: false,
+            buffered: Cell::new(true),
         })
     }
     fn valid(&self) -> Result<()> {
@@ -117,7 +122,8 @@ impl Client {
         method: &str,
         args: A,
     ) -> Result<R> {
-        self.valid()?;
+        self.verify_owner()?;
+        self.buffered.set(true);
         self.connection
             .with_proxy(&self.owner, OBJECT_PATH, self.timeout)
             .method_call(INTERFACE_NAME, method, args)
@@ -164,9 +170,50 @@ impl Client {
         validate_session_id(sid)?;
         self.rpc("UpdateSessionAttrs", (sid, set, remove))
     }
-    pub fn schedule_close_session(&self, sid: &str) -> Result<()> {
-        validate_session_id(sid)?;
-        self.rpc("ScheduleCloseSession", (sid,))
+    pub fn schedule_close_session(&self) -> Result<()> {
+        self.rpc("ScheduleCloseSession", ())
+    }
+    pub fn verify_owner(&self) -> Result<()> {
+        self.valid()?;
+        self.buffered.set(true);
+        if name_owner(&self.connection, self.timeout)? != self.owner {
+            self.events
+                .lock()
+                .expect("event mutex poisoned")
+                .invalidate(Event::OwnerReplaced);
+            return Err(Error::new(ErrorCode::Transport, "sessiond owner replaced"));
+        }
+        Ok(())
+    }
+    /// No asynchronous RPC timers: None means no transport deadline.
+    pub fn poll_state(&self) -> (dbus::channel::Watch, bool, Option<Duration>) {
+        (
+            self.connection.channel().watch(),
+            self.buffered.get()
+                || !self
+                    .events
+                    .lock()
+                    .expect("event mutex poisoned")
+                    .queue
+                    .is_empty(),
+            None,
+        )
+    }
+    pub fn dispatch(&self, limit: usize) -> Result<bool> {
+        if !(1..=256).contains(&limit) {
+            return Err(Error::new(
+                ErrorCode::InvalidArgument,
+                "dispatch limit must be 1..256",
+            ));
+        }
+        for _ in 0..limit {
+            if !self.connection.process(Duration::ZERO).map_err(remote)? {
+                self.buffered.set(false);
+                return Ok(false);
+            }
+        }
+        self.buffered.set(true);
+        Ok(true)
     }
     pub fn close_session(&self, sid: &str) -> Result<()> {
         validate_session_id(sid)?;
@@ -253,9 +300,11 @@ impl Client {
         {
             return Ok(Some(event));
         }
-        self.connection
+        let processed = self
+            .connection
             .process(wait.min(self.timeout))
             .map_err(remote)?;
+        self.buffered.set(processed);
         Ok(self
             .events
             .lock()

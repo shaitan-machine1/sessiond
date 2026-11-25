@@ -1,10 +1,7 @@
 use clap::{Parser, ValueEnum};
 use sessiond::{SessionCore, config::Config, locking::Singleton, scheduler::Scheduler};
 use std::path::PathBuf;
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::Arc;
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum BusChoice {
     System,
@@ -67,8 +64,6 @@ fn main() -> anyhow::Result<()> {
         let (signals, receiver) = tokio::sync::mpsc::channel(128);
         let core = Arc::new(SessionCore::with_signals(config, signals)?);
         let scheduler = Scheduler::new(core);
-        let stopping = Arc::new(AtomicBool::new(false));
-        let observer = sessiond::observation::start(scheduler.clone(), stopping.clone())?;
         let result = sessiond::dbus::serve(
             matches!(args.bus, BusChoice::Session),
             scheduler.clone(),
@@ -78,8 +73,6 @@ fn main() -> anyhow::Result<()> {
         // Keep the lifetime lock held until every admitted effect has completed.
         // Grace deadlines are not reset; accepted cleanup remains owned here.
         scheduler.shutdown();
-        stopping.store(true, Ordering::Relaxed);
-        observer.join().expect("observer panicked");
         result
     })
 }

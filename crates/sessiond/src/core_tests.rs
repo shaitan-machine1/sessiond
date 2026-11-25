@@ -87,12 +87,27 @@ fn initializer_age_uses_precise_mtime_and_a_fixed_ten_second_boundary() {
     );
 }
 #[test]
-fn partial_inventory_and_attributes_do_not_depend_on_master_storage_or_semantics() {
+fn validity_hides_partial_roots_and_ready_is_daemon_owned() {
     let (root, _, core, mut signals) = fixture(false);
     assert_eq!(
         core.get_master(SID).unwrap_err().public().code,
-        ErrorCode::MasterNotRecorded
+        ErrorCode::SessionNotFound
     );
+    assert!(core.list_infos().unwrap().is_empty());
+    assert!(core.find_session(SID).unwrap().is_some());
+    let (_, _, pinned) = core.session_scope(SID).unwrap();
+    record(
+        root.path(),
+        &format!(
+            "v2:{}:{}",
+            std::process::id(),
+            lib_scoped::read_start_time(std::process::id()).unwrap()
+        ),
+    );
+    assert!(core.get_session(SID).is_err());
+    pinned
+        .replace_attributes(&Attributes::from([("ready".into(), "1".into())]))
+        .unwrap();
     let original = core.get_session(SID).unwrap();
     let attributes = Attributes::from([
         ("runtime_dir".into(), "/inert".into()),
@@ -105,8 +120,26 @@ fn partial_inventory_and_attributes_do_not_depend_on_master_storage_or_semantics
         vec![],
     )
     .unwrap();
-    assert_eq!(core.get_attrs(SID).unwrap(), attributes);
+    let mut published = attributes.clone();
+    published.insert("ready".into(), "1".into());
+    assert_eq!(core.get_attrs(SID).unwrap(), published);
     assert_eq!(core.get_session(SID).unwrap(), original);
+    assert!(
+        core.update_attrs(
+            core.session_scope(SID).unwrap().2,
+            Attributes::from([("ready".into(), "0".into())]),
+            vec![]
+        )
+        .is_err()
+    );
+    assert!(
+        core.update_attrs(
+            core.session_scope(SID).unwrap().2,
+            Attributes::new(),
+            vec!["ready".into()]
+        )
+        .is_err()
+    );
     assert!(
         core.update_attrs(
             core.session_scope(SID).unwrap().2,
@@ -115,7 +148,7 @@ fn partial_inventory_and_attributes_do_not_depend_on_master_storage_or_semantics
         )
         .is_err()
     );
-    assert_eq!(core.get_attrs(SID).unwrap(), attributes);
+    assert_eq!(core.get_attrs(SID).unwrap(), published);
     core.update_attrs(
         core.session_scope(SID).unwrap().2,
         Attributes::new(),
@@ -124,13 +157,41 @@ fn partial_inventory_and_attributes_do_not_depend_on_master_storage_or_semantics
     .unwrap();
     assert!(!core.get_attrs(SID).unwrap().contains_key("sid"));
     record(root.path(), "malformed");
-    assert_eq!(core.list_infos().unwrap(), vec![original]);
+    assert!(core.list_infos().is_err());
     assert_eq!(
         core.get_master(SID).unwrap_err().public().code,
         ErrorCode::BackendError
     );
     assert!(core.reconcile(1000).is_err());
     assert!(core.find_session(SID).unwrap().is_some());
+    assert!(signals.try_recv().is_err());
+}
+#[test]
+fn dead_or_reused_master_is_hidden_without_triggering_removal() {
+    let (root, domain, core, mut signals) = fixture(false);
+    let scope = well_known::sessiond_user_session(1000, SID).unwrap();
+    domain
+        .pin_scope(&scope)
+        .unwrap()
+        .replace_attributes(&Attributes::from([("ready".into(), "1".into())]))
+        .unwrap();
+    record(
+        root.path(),
+        &format!(
+            "v2:{}:{}",
+            std::process::id(),
+            lib_scoped::read_start_time(std::process::id()).unwrap() + 1
+        ),
+    );
+    assert!(core.list_infos().unwrap().is_empty());
+    for code in [
+        core.get_session(SID).unwrap_err().public().code,
+        core.get_attrs(SID).unwrap_err().public().code,
+        core.get_master(SID).unwrap_err().public().code,
+    ] {
+        assert_eq!(code, ErrorCode::SessionNotFound);
+    }
+    assert!(domain.scope_identity(&scope).unwrap().is_some());
     assert!(signals.try_recv().is_err());
 }
 #[test]
@@ -170,8 +231,8 @@ fn process_lookup_is_instance_checked_and_queries_never_repair() {
     assert!(!root.path().join("runtime").exists());
 }
 #[test]
-fn recent_or_future_untracked_roots_retain_resources_and_are_not_ready_assertions() {
-    let (root, domain, core, mut signals) = fixture(false);
+fn recent_or_future_untracked_roots_are_not_cleanup_eligible() {
+    let (root, domain, core, mut signals) = fixture(true);
     let id = well_known::sessiond_user_session(1000, SID).unwrap();
     let directory = fs::File::open(root.path().join(id.as_str())).unwrap();
     for time in [
@@ -215,7 +276,14 @@ fn an_admitted_attribute_patch_cannot_follow_a_replacement_generation() {
         )
         .is_err()
     );
-    assert!(core.get_attrs(SID).unwrap().is_empty());
+    assert!(
+        core.session_scope(SID)
+            .unwrap()
+            .2
+            .get_attributes()
+            .unwrap()
+            .is_empty()
+    );
 }
 #[test]
 fn absent_tree_close_completion_is_not_shared_resource_cleanup() {
@@ -232,6 +300,22 @@ fn absent_tree_close_completion_is_not_shared_resource_cleanup() {
     core.close_tree(SID, Some(generation)).unwrap();
     assert!(receiver.borrow().as_ref().unwrap().is_ok());
     assert!(root.path().join("shared-resource-marker").exists());
+    assert!(signals.try_recv().is_err());
+}
+#[test]
+#[ignore = "requires root; disposable runtime-only fixture, no real cgroup"]
+fn young_invalid_roots_do_not_retain_runtime_or_get_pruned() {
+    assert_eq!(unsafe { libc::geteuid() }, 0);
+    let (root, domain, core, mut signals) = fixture(false);
+    runtime::ensure(&core.config.runtime_parent, 1000, 1000).unwrap();
+    core.reconcile(1000).unwrap();
+    assert!(!root.path().join("runtime/1000").exists());
+    assert!(
+        domain
+            .scope_identity(&well_known::sessiond_user_session(1000, SID).unwrap())
+            .unwrap()
+            .is_some()
+    );
     assert!(signals.try_recv().is_err());
 }
 #[test]

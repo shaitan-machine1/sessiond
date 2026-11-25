@@ -80,7 +80,7 @@ fn immediate_close_joins_grace_and_zero_grace_has_no_wait() {
     }
 }
 #[test]
-fn an_already_exited_or_reused_master_bypasses_grace() {
+fn master_death_does_not_create_a_watch_or_change_the_scheduled_deadline() {
     use std::os::fd::AsRawFd;
     let (root, _, scheduler) = fixture(Duration::from_secs(10), false);
     let directory = std::fs::File::open(
@@ -108,11 +108,19 @@ fn an_already_exited_or_reused_master_bypasses_grace() {
     );
     let now = Instant::now();
     scheduler.schedule_at(SID, false, now).unwrap();
-    assert!(matches!(
+    assert!(
         take(
             &scheduler.inner,
             &mut scheduler.inner.state.lock().unwrap(),
             now
+        )
+        .is_none()
+    );
+    assert!(matches!(
+        take(
+            &scheduler.inner,
+            &mut scheduler.inner.state.lock().unwrap(),
+            now + Duration::from_secs(10)
         ),
         Some(Work::Close { .. })
     ));

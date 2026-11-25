@@ -1,6 +1,4 @@
-use lib_sessiond::{
-    bus::Client, current_process_start_time, open_session_with_options, ErrorCode, OpenOptions,
-};
+use lib_sessiond::{bus::Client, open_session_with_options, OpenOptions};
 use nix::unistd::User;
 use pamsm::{pam_module, LogLvl, Pam, PamError, PamFlags, PamLibExt, PamServiceModule};
 use std::time::Duration;
@@ -37,10 +35,23 @@ fn failed(pam: &Pam, status: PamError, message: impl std::fmt::Display) -> PamEr
 struct Core;
 impl PamServiceModule for Core {
     fn open_session(pam: Pam, _: PamFlags, args: Vec<String>) -> PamError {
-        let options = match options(&args) {
+        let mut options = match options(&args) {
             Ok(options) => options,
             Err(error) => return failed(&pam, PamError::SERVICE_ERR, error),
         };
+        match pam.getenv("XDG_SEAT") {
+            Ok(Some(seat)) => match seat.to_str() {
+                Ok(seat) => {
+                    options
+                        .local
+                        .initial_attributes
+                        .insert("XDG_SEAT".into(), seat.into());
+                }
+                Err(e) => return failed(&pam, PamError::SESSION_ERR, e),
+            },
+            Ok(None) => {}
+            Err(e) => return failed(&pam, PamError::SESSION_ERR, e),
+        }
         let user = match pam.get_user(None) {
             Ok(Some(user)) => match user.to_str() {
                 Ok(user) => user,
@@ -68,16 +79,8 @@ impl PamServiceModule for Core {
             Ok(options) => options,
             Err(error) => return failed(&pam, PamError::SERVICE_ERR, error),
         };
-        let result = (|| {
-            let start_time = current_process_start_time()?;
-            let client = Client::system(options.timeout)?;
-            let session = match client.get_session_by_pid(std::process::id(), start_time) {
-                Ok(session) => session,
-                Err(error) if error.code == ErrorCode::NoSession => return Ok(()),
-                Err(error) => return Err(error),
-            };
-            client.schedule_close_session(&session.sid)
-        })();
+        let result =
+            Client::system(options.timeout).and_then(|client| client.schedule_close_session());
         match result {
             Ok(()) => PamError::SUCCESS,
             Err(error) => failed(&pam, PamError::SESSION_ERR, error),

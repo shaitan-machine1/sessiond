@@ -59,7 +59,8 @@ uint32_t sessiond_ensure_session_ready(sessiond_client *, sessiond_session **, s
 uint32_t sessiond_update_session_attrs(sessiond_client *, const char *sid,
     const sessiond_attribute *set, size_t set_length,
     const char *const *remove, size_t remove_length, sessiond_error **);
-uint32_t sessiond_schedule_close_session(sessiond_client *, const char *sid, sessiond_error **);
+/* Resolve the authenticated caller's enclosing session, including unready scopes. */
+uint32_t sessiond_schedule_close_session(sessiond_client *, sessiond_error **);
 /* Success certifies session-tree removal only, not shared-resource cleanup.
  * Pending/timeout is not success; admitted cleanup continues.
  */
@@ -71,6 +72,11 @@ uint32_t sessiond_subscribe(sessiond_client *, sessiond_error **);
  * Further method calls on an invalidated client fail rather than follow owners.
  */
 uint32_t sessiond_next_event(sessiond_client *, uint64_t wait_ms, sessiond_event **, sessiond_error **);
+/* Borrowed descriptor; timeout_ms=-1 means no transport timer. */
+typedef struct { int32_t fd; int16_t events; uint32_t buffered; int64_t timeout_ms; } sessiond_poll_info;
+uint32_t sessiond_poll_state(sessiond_client *, sessiond_poll_info *, sessiond_error **);
+/* limit=1..256; more=1 means buffered work may remain. Drain next_event too. */
+uint32_t sessiond_dispatch(sessiond_client *, uint32_t limit, uint32_t *more, sessiond_error **);
 void sessiond_error_free(sessiond_error *);
 void sessiond_session_free(sessiond_session *);
 void sessiond_sessions_free(sessiond_sessions *);

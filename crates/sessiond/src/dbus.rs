@@ -138,23 +138,14 @@ impl Manager {
         let (caller, expected, scope) = self
             .execute(permit.clone(), None, move |core| {
                 let caller = Caller::acquire(&credentials)?;
-                let info = core.session_by_pid(caller.pid(), caller.start_time())?;
-                let (_, _, scope) = core.session_scope(&info.sid)?;
+                let (info, scope) = core.caller_scope(&caller)?;
                 caller.validate()?;
                 Ok((caller, info, scope))
             })
             .await?;
         let uid = expected.uid;
-        let scheduler = self.scheduler.clone();
         self.execute(permit, Some(uid), move |core| {
-            let result = core.ready(caller, expected, scope);
-            if result
-                .as_ref()
-                .is_err_and(|e| e.public().code == ErrorCode::NotReady)
-            {
-                scheduler.reconcile(uid);
-            }
-            result
+            core.ready(caller, expected, scope)
         })
         .await
     }
@@ -181,15 +172,28 @@ impl Manager {
     }
     async fn schedule_close_session(
         &self,
-        sid: String,
         #[zbus(connection)] connection: &Connection,
         #[zbus(header)] header: Header<'_>,
     ) -> Result<()> {
         let permit = self.permit.clone();
-        Self::credentials(connection, &header).await?;
+        let credentials = Self::credentials(connection, &header).await?;
+        let (caller, expected, scope) = self
+            .execute(permit.clone(), None, move |core| {
+                let caller = Caller::acquire(&credentials)?;
+                let (info, scope) = core.caller_scope(&caller)?;
+                Ok((caller, info, scope))
+            })
+            .await?;
         let scheduler = self.scheduler.clone();
-        self.execute(permit, None, move |_| {
-            scheduler.schedule(&sid, false).map(|_| ())
+        self.execute(permit, Some(expected.uid), move |core| {
+            let (current, pinned) = core.caller_scope(&caller)?;
+            if current != expected || pinned.identity() != scope.identity() {
+                return Err(crate::core::failure(
+                    ErrorCode::ProcessChanged,
+                    "caller/session changed before close admission",
+                ));
+            }
+            scheduler.schedule(&current.sid, false).map(|_| ())
         })
         .await
     }
@@ -201,10 +205,24 @@ impl Manager {
     ) -> Result<()> {
         let permit = self.permit.clone();
         let credentials = Self::credentials(connection, &header).await?;
-        let scheduler = self.scheduler.clone();
-        let completion = self
+        let captured_sid = sid.clone();
+        let (caller, target) = self
             .execute(permit.clone(), None, move |core| {
                 let caller = Caller::acquire(&credentials)?;
+                let target = match core.find_session(&captured_sid)? {
+                    Some(row) => Some((row.uid, core.session_scope(&captured_sid)?.2.identity())),
+                    None => None,
+                };
+                Ok((caller, target))
+            })
+            .await?;
+        let Some((uid, generation)) = target else {
+            return Ok(());
+        };
+        let scheduler = self.scheduler.clone();
+        let completion = self
+            .execute(permit.clone(), Some(uid), move |core| {
+                caller.validate()?;
                 if core
                     .session_for_process(caller.pid())?
                     .is_some_and(|session| session.id == sid)
@@ -214,8 +232,14 @@ impl Manager {
                         "blocking close refuses a caller inside the target session subtree",
                     ));
                 }
-                caller.validate()?;
-                scheduler.schedule(&sid, true)
+                match core.session_scope(&sid) {
+                    Ok((_, _, scope)) if scope.identity() == generation => {
+                        scheduler.schedule(&sid, true)
+                    }
+                    Ok(_) => Ok(None),
+                    Err(e) if e.public().code == ErrorCode::SessionNotFound => Ok(None),
+                    Err(e) => Err(e),
+                }
             })
             .await?;
         let Some(completion) = completion else {
@@ -368,10 +392,10 @@ pub(crate) async fn handle(
             )
         }
         "ScheduleCloseSession" => {
-            let (sid,) = args!((String,));
+            args!(());
             respond!(
                 manager
-                    .schedule_close_session(sid, connection, header.clone())
+                    .schedule_close_session(connection, header.clone())
                     .await
             )
         }

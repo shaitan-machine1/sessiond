@@ -5,7 +5,6 @@ pub mod dbus;
 mod dispatch;
 mod inventory;
 pub mod locking;
-pub mod observation;
 mod runtime;
 pub mod scheduler;
 mod shutdown;

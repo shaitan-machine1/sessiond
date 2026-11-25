@@ -30,7 +30,13 @@ fn main() -> anyhow::Result<()> {
             return Err(std::io::Error::last_os_error().into());
         }
     }
-    let opened = open_session_with_options(uid, &OpenOptions { cgroup_root: root })?;
+    let opened = open_session_with_options(
+        uid,
+        &OpenOptions {
+            cgroup_root: root,
+            ..OpenOptions::default()
+        },
+    )?;
     let info = Client::system(Duration::from_secs(30))?.ensure_session_ready()?;
     if let Some(path) = output {
         let mut file = std::fs::File::create(path)?;
@@ -41,6 +47,6 @@ fn main() -> anyhow::Result<()> {
     while !STOP.load(Ordering::Relaxed) {
         std::thread::sleep(Duration::from_millis(100));
     }
-    Client::system(Duration::from_secs(30))?.schedule_close_session(&opened.sid)?;
+    Client::system(Duration::from_secs(30))?.schedule_close_session()?;
     Ok(())
 }

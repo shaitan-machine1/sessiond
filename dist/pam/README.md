@@ -15,6 +15,9 @@ managed `session include sessiond-session` block before session `pam_env.so`.
 
 Core resolves the final PAM UID, locally self-opens and overwrites
 `XDG_SESSION_ID` with actual local identity, even when a stale value was supplied.
+It stores only supplied PAM `XDG_SEAT` locally as initial attributes, before
+readiness; it does not verify seat provenance or copy other environment fields.
+Only the daemon may publish the protected `ready=1` initialization marker.
 It succeeds without sessiond, runtime or manager. Core errors are actual errors:
 `required` fails the overall stack, though later entries can still execute.
 There is no `fail_open` or full-daemon `config=PATH` option. Minimal options are
@@ -22,20 +25,23 @@ There is no `fail_open` or full-daemon `config=PATH` option. Minimal options are
 close's blocking transport; concurrent opening within one host is unsupported.
 
 Readiness first removes any supplied `XDG_RUNTIME_DIR`, even before option
-parsing or connecting. It then ensures daemon readiness, copies only supplied
-PAM `XDG_SEAT` into opaque session attributes when present, and publishes runtime
-from validated `SessionInfo`. The supplied seat is not independently verified.
+parsing or connecting. It then ensures daemon readiness and publishes runtime
+from validated `SessionInfo`, without copying any session attribute.
 Its only option is `timeout=DURATION`. Bus ProcessFD support is required for
-readiness, not for local core open.
+readiness and scheduled close, not for local core open.
 
-After successful initial unsetting, any readiness/attribute/publication error
+After successful initial unsetting, any readiness/publication error
 leaves runtime absent and never restores stale values. Core SID remains intact.
 A failure to unset is itself an error, not successful sanitation. Optional policy
-can still permit overall PAM success, without runtime, manager or seat metadata;
-applications must tolerate this. Unexpected panics abort the PAM host by design.
+can still permit overall PAM success in a publicly invisible unready scope;
+applications must tolerate this. Required-core failure returns a PAM error, not
+intentional abort/exit: the dedicated application's session host must then end.
+No close-on-open-failure or daemon-dependent rollback is assumed. Unexpected
+Rust panics remain fatal bugs, not ordinary failure handling.
 
-Only core close resolves current PID/start membership through sessiond and calls
-`ScheduleCloseSession`, without waiting for teardown. Readiness close does
+Only core close calls `ScheduleCloseSession()` directly, without a public lookup
+or SID argument. The daemon resolves the authenticated caller's private enclosing
+session, including unready scopes, and returns after admission, not teardown. Readiness close does
 nothing. Missing daemon is an actual close error, not silently `NoSession`.
 
 Neither module sets `DBUS_SESSION_BUS_ADDRESS`. Administrators may arrange a

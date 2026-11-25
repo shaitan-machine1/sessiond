@@ -8,7 +8,7 @@
     <method name="GetSessionAttrs"><arg name="sid" type="s" direction="in"/><arg name="attributes" type="a{ss}" direction="out"/></method>
     <method name="EnsureSessionReady"><arg name="session" type="(sus)" direction="out"/></method>
     <method name="UpdateSessionAttrs"><arg name="sid" type="s" direction="in"/><arg name="set" type="a{ss}" direction="in"/><arg name="remove" type="as" direction="in"/></method>
-    <method name="ScheduleCloseSession"><arg name="sid" type="s" direction="in"/></method>
+    <method name="ScheduleCloseSession"/>
     <method name="CloseSession"><arg name="sid" type="s" direction="in"/></method>
     <signal name="SessionNew"><arg name="sid" type="s"/><arg name="uid" type="u"/></signal>
     <signal name="SessionRemoved"><arg name="sid" type="s"/><arg name="uid" type="u"/></signal>
